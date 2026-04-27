@@ -368,7 +368,8 @@ comp_render_gfx_add_target(struct comp_render_dispatch_data *data, struct render
  */
 static inline void
 comp_render_gfx_add_squash_view(struct comp_render_dispatch_data *data,
-                                const struct xrt_pose *world_pose,
+                                const struct xrt_pose *world_pose_scanout_begin,
+                                const struct xrt_pose *world_pose_scanout_end,
                                 const struct xrt_pose *eye_pose,
                                 const struct xrt_fov *fov,
                                 VkImage squash_image,
@@ -377,8 +378,8 @@ comp_render_gfx_add_squash_view(struct comp_render_dispatch_data *data,
 {
 	struct comp_render_view_data *view = comp_render_dispatch_add_squash_view( //
 	    data,                                                                  //
-	    world_pose,                                                            //
-	    world_pose,                                                            //
+	    world_pose_scanout_begin,                                              //
+	    world_pose_scanout_end,                                                //
 	    eye_pose,                                                              //
 	    fov,                                                                   //
 	    squash_image,                                                          //

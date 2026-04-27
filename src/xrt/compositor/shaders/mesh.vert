@@ -16,7 +16,8 @@ layout (binding = 1, std140) uniform Config
 
 	// Only used for timewarp.
 	vec4 pre_transform;
-	mat4 transform;
+	mat4 transform_scanout_begin;
+	mat4 transform_scanout_end;
 } ubo;
 
 layout (location = 0)  in vec4 in_pos_ruv;
@@ -42,7 +43,7 @@ vec2 transform_uv_subimage(vec2 uv)
 	return values.xy;
 }
 
-vec2 transform_uv_timewarp(vec2 uv)
+vec2 transform_uv_timewarp(vec2 uv, float scanout_fraction)
 {
 	vec4 values = vec4(uv, -1, 1);
 
@@ -50,8 +51,9 @@ vec2 transform_uv_timewarp(vec2 uv)
 	values.xy = fma(values.xy, ubo.pre_transform.zw, ubo.pre_transform.xy);
 	values.y = -values.y; // Flip to OpenXR coordinate system.
 
-	// Timewarp.
-	values = ubo.transform * values;
+	// Timewarp + scanout compensation.
+	values = ubo.transform_scanout_begin * values * (1.0 - scanout_fraction) +
+	         ubo.transform_scanout_end * values * scanout_fraction;
 	values.xy = values.xy * (1.0 / max(values.w, 0.00001));
 
 	// From [-1, 1] to [0, 1]
@@ -64,10 +66,10 @@ vec2 transform_uv_timewarp(vec2 uv)
 	return values.xy;
 }
 
-vec2 transform_uv(vec2 uv)
+vec2 transform_uv(vec2 uv, float scanout_fraction)
 {
 	if (do_timewarp) {
-		return transform_uv_timewarp(uv);
+		return transform_uv_timewarp(uv, scanout_fraction);
 	} else {
 		return transform_uv_subimage(uv);
 	}
@@ -83,13 +85,15 @@ void main()
 	vec2 pos = rot * in_pos_ruv.xy;
 	gl_Position = vec4(pos, 0.0f, 1.0f);
 
+	float scanout_fraction = pos.y * 0.5 + 0.5;
+
 	vec2 r_uv = in_pos_ruv.zw;
 	vec2 g_uv = in_guv_buv.xy;
 	vec2 b_uv = in_guv_buv.zw;
 
-	r_uv = transform_uv(r_uv);
-	g_uv = transform_uv(g_uv);
-	b_uv = transform_uv(b_uv);
+	r_uv = transform_uv(r_uv, scanout_fraction);
+	g_uv = transform_uv(g_uv, scanout_fraction);
+	b_uv = transform_uv(b_uv, scanout_fraction);
 
 	out_r_uv = r_uv;
 	out_g_uv = g_uv;

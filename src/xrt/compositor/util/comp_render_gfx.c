@@ -543,7 +543,13 @@ crg_distortion_common(struct render_gfx *render,
 			    &md->views[i].src_pose,                //
 			    &md->views[i].src_fov,                 //
 			    &d->views[i].world_pose_scanout_begin, //
-			    &data.transform);                      //
+			    &data.transform_scanout_begin);        //
+
+			render_calc_time_warp_matrix(            //
+			    &md->views[i].src_pose,              //
+			    &md->views[i].src_fov,               //
+			    &d->views[i].world_pose_scanout_end, //
+			    &data.transform_scanout_end);        //
 		}
 
 		ret = render_gfx_mesh_alloc_and_write( //
@@ -619,10 +625,9 @@ crg_distortion_after_squash(struct render_gfx *render, const struct comp_render_
 		    src_image_view);       //
 	}
 
-	// We are passing in the same old and new poses.
 	crg_distortion_common( //
 	    render,            //
-	    false,             // do_timewarp
+	    d->do_timewarp,    //
 	    &md,               //
 	    d);                //
 }

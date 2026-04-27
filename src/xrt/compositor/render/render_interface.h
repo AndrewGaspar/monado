@@ -893,7 +893,8 @@ struct render_gfx_mesh_ubo_data
 
 	// Only used for timewarp.
 	struct xrt_normalized_rect pre_transform;
-	struct xrt_matrix_4x4 transform;
+	struct xrt_matrix_4x4 transform_scanout_begin;
+	struct xrt_matrix_4x4 transform_scanout_end;
 };
 
 /*!
