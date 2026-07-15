@@ -251,25 +251,132 @@ parse_calibration_json(struct xreal_air_parsed_calibration *calibration, cJSON *
  */
 #include <stdio.h>
 
-bool
-xreal_air_parse_calibration_buffer(struct xreal_air_parsed_calibration *calibration, const char *buffer, size_t size)
+void
+xreal_air_calibration_set_defaults(struct xreal_air_parsed_calibration *calibration)
 {
-	bool result = false;
+	// Sane, non-degenerate IMU calibration used as a starting point (and as a fallback if the
+	// factory calibration can't be parsed). Identity misalignment quaternions, unit scale and zero
+	// bias mean read_sample_and_apply_calibration() passes the raw (already unit-converted) samples
+	// through unchanged instead of multiplying them by an all-zero (calloc'd) calibration, which
+	// would zero out the gyro/accel and freeze the 3DoF fusion.
+	memset(calibration, 0, sizeof(*calibration));
 
-	cJSON *root = cJSON_ParseWithLength(buffer, size);
-	cJSON *imu = cJSON_GetObjectItem(root, "IMU");
+	calibration->accel_q_gyro = (struct xrt_quat){0.0f, 0.0f, 0.0f, 1.0f};
+	calibration->gyro_q_mag = (struct xrt_quat){0.0f, 0.0f, 0.0f, 1.0f};
 
-	if (imu) {
-		cJSON *dev1 = cJSON_GetObjectItem(imu, "device_1");
+	calibration->scale_accel = (struct xrt_vec3){1.0f, 1.0f, 1.0f};
+	calibration->scale_gyro = (struct xrt_vec3){1.0f, 1.0f, 1.0f};
+	calibration->scale_mag = (struct xrt_vec3){1.0f, 1.0f, 1.0f};
+}
 
-		if (dev1) {
-			parse_calibration_json(calibration, dev1);
-			result = true;
+/*!
+ * Locate the self-contained `"IMU": { ... }` object inside a (possibly larger, or partially
+ * mis-assembled) calibration blob and return the byte range of the object VALUE (the `{ ... }`).
+ *
+ * The Xreal Air 2 Ultra returns a ~55 KB factory blob that bundles the per-eye display distortion
+ * meshes AND the IMU calibration into one JSON document. In practice the segmented HID transfer of
+ * that blob does not reassemble into a byte-0 valid JSON document on this device (the leading
+ * `{"left_display":{"data":[` is missing and there is a zero-filled gap before the `{"FSN":...}`
+ * root), so cJSON_ParseWithLength() over the whole buffer fails. The embedded `"IMU"` object itself
+ * is intact, however, and its schema is exactly what parse_calibration_json() expects, so we scan
+ * for it and parse just that sub-object. Returns false if no complete IMU object is present.
+ */
+static bool
+find_imu_object(const char *buffer, size_t size, size_t *out_start, size_t *out_len)
+{
+	static const char needle[] = "\"IMU\"";
+	const size_t needle_len = sizeof(needle) - 1;
+
+	for (size_t i = 0; i + needle_len <= size; i++) {
+		if (memcmp(buffer + i, needle, needle_len) != 0) {
+			continue;
+		}
+
+		// Find the opening brace of the object value after "IMU":
+		size_t j = i + needle_len;
+		while (j < size && buffer[j] != '{') {
+			// Bail if we run into another key before an object value.
+			if (buffer[j] == '"') {
+				break;
+			}
+			j++;
+		}
+		if (j >= size || buffer[j] != '{') {
+			continue;
+		}
+
+		// Brace-match to the end of the object, respecting JSON strings and escapes.
+		int depth = 0;
+		bool in_string = false;
+		bool escaped = false;
+		for (size_t k = j; k < size; k++) {
+			char c = buffer[k];
+			if (in_string) {
+				if (escaped) {
+					escaped = false;
+				} else if (c == '\\') {
+					escaped = true;
+				} else if (c == '"') {
+					in_string = false;
+				}
+				continue;
+			}
+			if (c == '"') {
+				in_string = true;
+			} else if (c == '{') {
+				depth++;
+			} else if (c == '}') {
+				depth--;
+				if (depth == 0) {
+					*out_start = j;
+					*out_len = (k - j) + 1;
+					return true;
+				}
+			}
 		}
 	}
 
-	cJSON_Delete(root);
-	return result;
+	return false;
+}
+
+bool
+xreal_air_parse_calibration_buffer(struct xreal_air_parsed_calibration *calibration, const char *buffer, size_t size)
+{
+	// Start from sane defaults so any field the factory blob omits keeps a non-degenerate value.
+	xreal_air_calibration_set_defaults(calibration);
+
+	// Fast path: the whole buffer is one valid JSON document (original Xreal Air).
+	cJSON *root = cJSON_ParseWithLength(buffer, size);
+	if (root) {
+		cJSON *imu = cJSON_GetObjectItem(root, "IMU");
+		if (imu) {
+			cJSON *dev1 = cJSON_GetObjectItem(imu, "device_1");
+			if (dev1) {
+				parse_calibration_json(calibration, dev1);
+				cJSON_Delete(root);
+				return true;
+			}
+		}
+		cJSON_Delete(root);
+	}
+
+	// Fallback (Xreal Air 2 Ultra): the blob isn't byte-0 valid JSON, but the embedded "IMU"
+	// object is intact — extract and parse just that sub-object.
+	size_t imu_start = 0, imu_len = 0;
+	if (find_imu_object(buffer, size, &imu_start, &imu_len)) {
+		cJSON *imu = cJSON_ParseWithLength(buffer + imu_start, imu_len);
+		if (imu) {
+			cJSON *dev1 = cJSON_GetObjectItem(imu, "device_1");
+			if (dev1) {
+				parse_calibration_json(calibration, dev1);
+				cJSON_Delete(imu);
+				return true;
+			}
+			cJSON_Delete(imu);
+		}
+	}
+
+	return false;
 }
 
 #include <stdio.h>

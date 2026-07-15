@@ -472,15 +472,21 @@ handle_sensor_control_cal_data_get_next_segment(struct xreal_air_hmd *hmd,
 		// Parse calibration data from raw json.
 		if (!xreal_air_parse_calibration_buffer(&hmd->calibration, hmd->calibration_buffer,
 		                                        hmd->calibration_buffer_len)) {
-			hmd->calibration_valid = false;
-
-			XREAL_AIR_ERROR(hmd, "Failed parse calibration data!");
-		} else {
-			hmd->calibration_valid = true;
-
-			// Switch to imu sensor data stream
-			request_sensor_control_start_imu_data(hmd, 0x01);
+			// The factory calibration could not be parsed (e.g. the Air 2 Ultra's ~55 KB blob
+			// did not reassemble into a document we could locate the IMU object in). Fall back
+			// to the sane default IMU calibration that xreal_air_parse_calibration_buffer()
+			// already installed, and mark the calibration "valid" anyway so we (a) still start
+			// the IMU stream below and (b) stop re-requesting the large blob on every packet
+			// (which otherwise floods the log and hammers the HID bus indefinitely).
+			XREAL_AIR_ERROR(hmd, "Failed to parse factory calibration — using default IMU calibration");
 		}
+
+		hmd->calibration_valid = true;
+
+		// Switch to imu sensor data stream (0x01 = enable). On the Air 2 Ultra the stream also
+		// starts via the 0xAA path in the read thread, but sending the explicit enable here matches
+		// the original Air and is harmless if already streaming.
+		request_sensor_control_start_imu_data(hmd, 0x01);
 
 		// Free calibration buffer.
 		free(hmd->calibration_buffer);
@@ -1215,6 +1221,11 @@ xreal_air_hmd_create_device(struct os_hid_device *sensor_device,
 	hmd->calibration_buffer_len = 0;
 	hmd->calibration_buffer_pos = 0;
 	hmd->calibration_valid = false;
+
+	// Install a non-degenerate default IMU calibration up front (identity misalignment, unit scale,
+	// zero bias). The struct is otherwise calloc'd to all-zero, which would zero the scale factors
+	// and freeze the 3DoF fusion if a real calibration is never parsed.
+	xreal_air_calibration_set_defaults(&hmd->calibration);
 
 	hmd->state.brightness = 0xFF;
 	hmd->state.display_mode = 0x00;

@@ -35,6 +35,11 @@ DEBUG_GET_ONCE_BOOL_OPTION(xcb_fullscreen, "XRT_COMPOSITOR_XCB_FULLSCREEN", fals
 DEBUG_GET_ONCE_NUM_OPTION(xcb_display, "XRT_COMPOSITOR_XCB_DISPLAY", -1)
 DEBUG_GET_ONCE_NUM_OPTION(default_framerate, "XRT_COMPOSITOR_DEFAULT_FRAMERATE", 60)
 DEBUG_GET_ONCE_BOOL_OPTION(compute, "XRT_COMPOSITOR_COMPUTE", USE_COMPUTE_DEFAULT)
+// When the Wayland window backend is used to drive a real per-eye HMD panel (e.g. the XREAL Air
+// birdbath glasses via a fullscreen toplevel), halving the surface renders at quarter resolution and
+// upscales — soft. Default OFF so the surface matches the HMD's native width; set to 1 to restore the
+// old behaviour where the (windowed debug) surface is smaller than the HMD screen.
+DEBUG_GET_ONCE_BOOL_OPTION(wayland_halve_surface, "XRT_COMPOSITOR_WAYLAND_HALVE_SURFACE", false)
 // clang-format on
 
 static inline void
@@ -171,8 +176,11 @@ comp_settings_init(struct comp_settings *s, struct xrt_device *xdev)
 	if (debug_get_bool_option_force_wayland()) {
 		s->target_identifier = "wayland";
 
-		// HMD screen tends to be much larger then monitors.
-		s->preferred.width /= 2;
-		s->preferred.height /= 2;
+		// HMD screen tends to be much larger then monitors. Only halve when explicitly requested —
+		// for a real per-eye panel we want the full native surface (see option above).
+		if (debug_get_bool_option_wayland_halve_surface()) {
+			s->preferred.width /= 2;
+			s->preferred.height /= 2;
+		}
 	}
 }
