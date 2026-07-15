@@ -420,12 +420,38 @@ handle_sensor_control_get_cal_data_length(struct xreal_air_hmd *hmd,
 	const uint32_t calibration_data_length =
 	    ((data->data[0] << 0u) | (data->data[1] << 8u) | (data->data[2] << 16u) | (data->data[3] << 24u));
 
-	if (getenv("XREAL_CAL_DUMP")) {
-		XREAL_AIR_ERROR(hmd, "[CALDBG] GET_CAL_DATA_LENGTH reply: len=%u data.length=%u msgid=0x%02x",
-		                calibration_data_length, data->length, data->msgid);
+	// The device reports the DOCUMENT length here (the Air 2 Ultra: 55845 bytes of JSON). The flash
+	// calibration region, however, is zero-padded up to the segment boundary (padded size = 111*504 =
+	// 55944 for the Air 2 Ultra, i.e. a 99-byte zero pad), and the firmware's segment read cursor is
+	// NOT reset by GET_CAL_DATA_LENGTH — it drifts and wraps at that PADDED size. If we read only
+	// `calibration_data_length` bytes we get a window that is (padded - length) bytes short of one full
+	// flash period, so unless the cursor happens to sit exactly at the document start the window
+	// permanently OMITS that many bytes of the actual document (and includes the zero pad instead) —
+	// a loss no de-rotation can undo, which silently corrupts the parse or drops us to default cal.
+	//
+	// Fix: read the FULL padded period by rounding the reported length up to the segment-payload
+	// boundary. The window is then a clean rotation of [document + zero-pad] with EVERY document byte
+	// present; xreal_air_parse_calibration_buffer() de-rotates around the zero-pad seam and recovers
+	// the whole document regardless of where the cursor happened to be. (Reading exactly one period
+	// also leaves the firmware cursor where it started, since it advances one segment per read.)
+	uint16_t seg = SENSOR_BUFFER_SIZE;
+	if (seg > hmd->max_sensor_buffer_size) {
+		seg = hmd->max_sensor_buffer_size;
+	}
+	const uint32_t segment_payload = (seg > 8) ? (uint32_t)(seg - 8) : 0;
+	uint32_t read_len = calibration_data_length;
+	if (segment_payload > 0 && calibration_data_length > 0) {
+		read_len = ((calibration_data_length + segment_payload - 1) / segment_payload) * segment_payload;
 	}
 
-	hmd->calibration_buffer_len = calibration_data_length;
+	if (getenv("XREAL_CAL_DUMP")) {
+		XREAL_AIR_ERROR(hmd,
+		                "[CALDBG] GET_CAL_DATA_LENGTH reply: len=%u data.length=%u msgid=0x%02x "
+		                "seg_payload=%u -> reading padded period=%u",
+		                calibration_data_length, data->length, data->msgid, segment_payload, read_len);
+	}
+
+	hmd->calibration_buffer_len = read_len;
 	hmd->calibration_valid = false;
 
 	if (hmd->calibration_buffer_len > 0) {
