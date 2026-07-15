@@ -89,7 +89,17 @@ struct xreal_air_hmd
 	} read;
 
 	uint32_t static_id;
+
+	//! Hardware wear signal, protected by the device_mutex. Set from the control
+	//! interface's XREAL_AIR_MSG_P_DISPLAY_TOGGLED (0x6C04) / button-toggle events
+	//! (true = display/panels on = donned, false = doffed). Go through
+	//! xreal_air_set_display_on() so @ref display_on_change_ns tracks the edge.
 	bool display_on;
+	//! os_monotonic time of the last @ref display_on transition (for debounce).
+	timepoint_ns display_on_change_ns;
+	//! Debounced presence last handed out by xreal_air_hmd_get_presence().
+	bool presence_reported;
+
 	uint8_t blend_state;
 	uint8_t control_mode;
 	uint8_t imu_stream_state;
@@ -785,13 +795,28 @@ handle_control_heartbeat_start(struct xreal_air_hmd *hmd, const struct xreal_air
 	// TODO
 }
 
+//! Update @ref display_on, stamping @ref display_on_change_ns on a real edge so
+//! xreal_air_hmd_get_presence() can debounce. Callers must hold device_mutex.
+static void
+xreal_air_set_display_on(struct xreal_air_hmd *hmd, bool on)
+{
+	if (hmd->display_on == on) {
+		return;
+	}
+
+	hmd->display_on = on;
+	hmd->display_on_change_ns = (timepoint_ns)os_monotonic_get_ns();
+}
+
 static void
 handle_control_display_toggled(struct xreal_air_hmd *hmd, const struct xreal_air_parsed_control *control)
 {
-	// State of display
+	// State of display: this is the hardware proximity/wear signal. The Air 2 Ultra
+	// pushes this on every physical don (state != 0 -> "Open OLED 2D") / doff
+	// (state == 0 -> "Close OLED"). Drives user-presence via get_presence.
 	const uint8_t display_state = control->data[0];
 
-	hmd->display_on = (display_state != 0);
+	xreal_air_set_display_on(hmd, display_state != 0);
 }
 
 static void
@@ -808,7 +833,7 @@ handle_control_button(struct xreal_air_hmd *hmd, const struct xreal_air_parsed_c
 
 	switch (virt_button) {
 	case XREAL_AIR_BUTTON_VIRT_DISPLAY_TOGGLE: {
-		hmd->display_on = value;
+		xreal_air_set_display_on(hmd, value != 0);
 		break;
 	}
 	case XREAL_AIR_BUTTON_VIRT_MENU_TOGGLE: break;
@@ -881,7 +906,7 @@ static void
 handle_control_async_text(struct xreal_air_hmd *hmd, const struct xreal_air_parsed_control *control)
 {
 	// Event only appears if the display is active!
-	hmd->display_on = true;
+	xreal_air_set_display_on(hmd, true);
 
 	XREAL_AIR_DEBUG(hmd, "Control message: %s", (const char *)control->data);
 }
@@ -1180,6 +1205,35 @@ xreal_air_hmd_update_inputs(struct xrt_device *xdev)
 	return XRT_SUCCESS;
 }
 
+//! Debounce window for the hardware wear signal: a display_on edge is only handed
+//! out as a presence change once it has been stable this long, so a jittery
+//! proximity threshold can't flicker user-presence. The captured don/doff
+//! transitions were clean single edges, so this is deliberately light.
+#define XREAL_AIR_PRESENCE_DEBOUNCE_NS (400 * (timepoint_ns)U_TIME_1MS_IN_NS)
+
+static xrt_result_t
+xreal_air_hmd_get_presence(struct xrt_device *xdev, bool *out_presence)
+{
+	struct xreal_air_hmd *hmd = xreal_air_hmd(xdev);
+
+	os_mutex_lock(&hmd->device_mutex);
+
+	// Accept the raw hardware state only once it has held steady for the debounce
+	// window. A pre-existing stable state (e.g. donned before session begin, whose
+	// edge is far in the past) is accepted on the first read, so the session-begin
+	// snapshot is correct; a fresh flip is held until it settles.
+	const timepoint_ns now = (timepoint_ns)os_monotonic_get_ns();
+	if (hmd->display_on != hmd->presence_reported &&
+	    (now - hmd->display_on_change_ns) >= XREAL_AIR_PRESENCE_DEBOUNCE_NS) {
+		hmd->presence_reported = hmd->display_on;
+	}
+	*out_presence = hmd->presence_reported;
+
+	os_mutex_unlock(&hmd->device_mutex);
+
+	return XRT_SUCCESS;
+}
+
 static xrt_result_t
 xreal_air_hmd_get_tracked_pose(struct xrt_device *xdev,
                                enum xrt_input_name name,
@@ -1246,6 +1300,7 @@ xreal_air_hmd_create_device(struct os_hid_device *sensor_device,
 	hmd->base.update_inputs = xreal_air_hmd_update_inputs;
 	hmd->base.get_tracked_pose = xreal_air_hmd_get_tracked_pose;
 	hmd->base.get_view_poses = u_device_get_view_poses;
+	hmd->base.get_presence = xreal_air_hmd_get_presence;
 	hmd->base.compute_distortion = u_distortion_mesh_none;
 	hmd->base.destroy = xreal_air_hmd_destroy;
 	hmd->base.name = XRT_DEVICE_GENERIC_HMD;
@@ -1253,6 +1308,10 @@ xreal_air_hmd_create_device(struct os_hid_device *sensor_device,
 	hmd->base.inputs[0].name = XRT_INPUT_GENERIC_HEAD_POSE;
 	hmd->base.supported.orientation_tracking = true;
 	hmd->base.supported.position_tracking = false;
+	// The control interface surfaces a real hardware wear signal (display on/off via
+	// the proximity sensor), so advertise user presence. This propagates to
+	// XrSystemUserPresencePropertiesEXT.supportsUserPresence (oxr_system.c).
+	hmd->base.supported.presence = true;
 
 	// Set up display details refresh rate
 	hmd->base.hmd->screens[0].nominal_frame_interval_ns = time_s_to_ns(1.0f / 60.0f);
@@ -1265,6 +1324,8 @@ xreal_air_hmd_create_device(struct os_hid_device *sensor_device,
 
 	hmd->static_id = 0;
 	hmd->display_on = false;
+	hmd->display_on_change_ns = 0;
+	hmd->presence_reported = false;
 	hmd->blend_state = XREAL_AIR_BLEND_STATE_DEFAULT;
 	hmd->control_mode = XREAL_AIR_CONTROL_MODE_BRIGHTNESS;
 	hmd->imu_stream_state = 0;

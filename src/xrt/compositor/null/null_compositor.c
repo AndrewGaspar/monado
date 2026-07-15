@@ -632,5 +632,5 @@ null_compositor_create_system(struct xrt_device *xdev, struct xrt_system_composi
 	XRT_MAYBE_UNUSED xrt_result_t xret = u_pa_factory_create(&upaf);
 	assert(xret == XRT_SUCCESS && upaf != NULL);
 
-	return comp_multi_create_system_compositor(&c->base.base, upaf, &c->sys_info, false, out_xsysc);
+	return comp_multi_create_system_compositor(&c->base.base, c->xdev, upaf, &c->sys_info, false, out_xsysc);
 }

@@ -336,6 +336,21 @@ struct multi_system_compositor
 	 */
 	struct u_pacing_app_factory *upaf;
 
+	/*!
+	 * Head device polled once per native frame for user presence
+	 * (XR_EXT_user_presence), so live don/doff reaches clients as a
+	 * @ref XRT_SESSION_EVENT_USER_PRESENCE_CHANGE. NULL (or a device that does
+	 * not advertise @ref xrt_device::supported.presence) disables the poll
+	 * entirely — zero cost when nothing is presence-capable. Not owned.
+	 */
+	struct xrt_device *head_xdev;
+
+	//! Last presence value broadcast to clients (only valid once @ref presence_valid).
+	bool last_presence;
+
+	//! Whether @ref last_presence holds a value yet (false before the first poll).
+	bool presence_valid;
+
 	//! Render loop thread.
 	struct os_thread_helper oth;
 

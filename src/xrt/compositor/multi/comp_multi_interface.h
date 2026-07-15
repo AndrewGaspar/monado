@@ -26,6 +26,8 @@ struct u_pacing_app_factory;
  * compositor and destroyed by it.
  *
  * @param xcn           Native compositor that client are multi-plexed to.
+ * @param head_xdev     Head device to poll for user presence each frame, or NULL
+ *                      if none is presence-capable (poll is skipped entirely).
  * @param upaf          App pacing factory, one pacer created per client.
  * @param xsci          Information to be exposed.
  * @param do_warm_start Should we always submit a frame at startup.
@@ -35,6 +37,7 @@ struct u_pacing_app_factory;
  */
 xrt_result_t
 comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
+                                    struct xrt_device *head_xdev,
                                     struct u_pacing_app_factory *upaf,
                                     const struct xrt_system_compositor_info *xsci,
                                     bool do_warm_start,

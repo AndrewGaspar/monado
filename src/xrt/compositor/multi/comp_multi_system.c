@@ -11,6 +11,7 @@
  */
 
 #include "xrt/xrt_config_os.h"
+#include "xrt/xrt_device.h"
 #include "xrt/xrt_session.h"
 
 #include "os/os_time.h"
@@ -392,6 +393,56 @@ broadcast_timings_to_pacers(struct multi_system_compositor *msc,
 	os_mutex_unlock(&msc->list_and_timing_lock);
 }
 
+/*!
+ * Poll the head device for user presence and, on a change (or the first poll),
+ * broadcast a @ref XRT_SESSION_EVENT_USER_PRESENCE_CHANGE to every client so live
+ * don/doff reaches the app as XR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT. This is
+ * the generic runtime propagation the vendored Monado otherwise lacks (get_presence
+ * is only read once at session begin) — it fixes live presence for any
+ * presence-capable driver (XReal, Rift CV1, PSVR2, ...). No-op and near-free when no
+ * presence-capable head device is bound (@ref multi_system_compositor::head_xdev is
+ * NULL). Called once per native frame on the multi main loop thread.
+ */
+static void
+poll_and_broadcast_presence(struct multi_system_compositor *msc)
+{
+	struct xrt_device *xdev = msc->head_xdev;
+	if (xdev == NULL) {
+		return;
+	}
+
+	bool presence = false;
+	xrt_result_t xret = xrt_device_get_presence(xdev, &presence);
+	if (xret != XRT_SUCCESS) {
+		return;
+	}
+
+	// Only act on an actual change (or the very first poll of the runtime).
+	if (msc->presence_valid && msc->last_presence == presence) {
+		return;
+	}
+	msc->last_presence = presence;
+	msc->presence_valid = true;
+
+	union xrt_session_event xse = XRT_STRUCT_INIT;
+	xse.type = XRT_SESSION_EVENT_USER_PRESENCE_CHANGE;
+	xse.presence_change.is_user_present = presence;
+
+	os_mutex_lock(&msc->list_and_timing_lock);
+	for (size_t i = 0; i < ARRAY_SIZE(msc->clients); i++) {
+		struct multi_compositor *mc = msc->clients[i];
+		if (mc == NULL) {
+			continue;
+		}
+
+		xrt_result_t pret = multi_compositor_push_event(mc, &xse);
+		if (pret != XRT_SUCCESS) {
+			U_LOG_W("Failed to push user-presence event to client: %d", pret);
+		}
+	}
+	os_mutex_unlock(&msc->list_and_timing_lock);
+}
+
 static void
 wait_frame(struct os_precise_sleeper *sleeper, struct xrt_compositor *xc, int64_t frame_id, int64_t wake_up_time_ns)
 {
@@ -546,6 +597,11 @@ multi_main_loop(struct multi_system_compositor *msc)
 		os_mutex_unlock(&msc->list_and_timing_lock);
 
 		xrt_comp_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
+
+		// Poll the head device for a don/doff (user-presence) change and, on a
+		// change, broadcast it to all clients. Near-free when no presence-capable
+		// device is bound.
+		poll_and_broadcast_presence(msc);
 
 		// Re-lock the thread for check in while statement.
 		os_thread_helper_lock(&msc->oth);
@@ -753,6 +809,7 @@ multi_system_compositor_update_session_status(struct multi_system_compositor *ms
 
 xrt_result_t
 comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
+                                    struct xrt_device *head_xdev,
                                     struct u_pacing_app_factory *upaf,
                                     const struct xrt_system_compositor_info *xsci,
                                     bool do_warm_start,
@@ -771,6 +828,11 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 	msc->base.info = *xsci;
 	msc->upaf = upaf;
 	msc->xcn = xcn;
+	// Only keep the head device for presence polling if it actually advertises
+	// user presence, so poll_and_broadcast_presence() is a no-op otherwise.
+	msc->head_xdev = (head_xdev != NULL && head_xdev->supported.presence) ? head_xdev : NULL;
+	msc->presence_valid = false;
+	msc->last_presence = false;
 	msc->sessions.active_count = 0;
 	msc->sessions.state = do_warm_start ? MULTI_SYSTEM_STATE_INIT_WARM_START : MULTI_SYSTEM_STATE_STOPPED;
 
