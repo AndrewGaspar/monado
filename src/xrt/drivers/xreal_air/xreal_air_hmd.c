@@ -30,6 +30,8 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #define XREAL_AIR_DEBUG(hmd, ...) U_LOG_XDEV_IFL_D(&hmd->base, hmd->log_level, __VA_ARGS__)
 #define XREAL_AIR_ERROR(hmd, ...) U_LOG_XDEV_IFL_E(&hmd->base, hmd->log_level, __VA_ARGS__)
@@ -408,6 +410,11 @@ handle_sensor_control_get_cal_data_length(struct xreal_air_hmd *hmd,
 	const uint32_t calibration_data_length =
 	    ((data->data[0] << 0u) | (data->data[1] << 8u) | (data->data[2] << 16u) | (data->data[3] << 24u));
 
+	if (getenv("XREAL_CAL_DUMP")) {
+		XREAL_AIR_ERROR(hmd, "[CALDBG] GET_CAL_DATA_LENGTH reply: len=%u data.length=%u msgid=0x%02x",
+		                calibration_data_length, data->length, data->msgid);
+	}
+
 	hmd->calibration_buffer_len = calibration_data_length;
 	hmd->calibration_valid = false;
 
@@ -469,6 +476,15 @@ handle_sensor_control_cal_data_get_next_segment(struct xreal_air_hmd *hmd,
 	hmd->calibration_buffer_pos += next;
 
 	if (hmd->calibration_buffer_pos == hmd->calibration_buffer_len) {
+		if (getenv("XREAL_CAL_DUMP")) {
+			FILE *f = fopen("/tmp/xreal_cal_dump_fresh.bin", "wb");
+			if (f) {
+				fwrite(hmd->calibration_buffer, 1, hmd->calibration_buffer_len, f);
+				fclose(f);
+				XREAL_AIR_ERROR(hmd, "[CALDBG] wrote /tmp/xreal_cal_dump_fresh.bin (%u bytes)",
+				                hmd->calibration_buffer_len);
+			}
+		}
 		// Parse calibration data from raw json.
 		if (!xreal_air_parse_calibration_buffer(&hmd->calibration, hmd->calibration_buffer,
 		                                        hmd->calibration_buffer_len)) {
@@ -479,6 +495,28 @@ handle_sensor_control_cal_data_get_next_segment(struct xreal_air_hmd *hmd,
 			// the IMU stream below and (b) stop re-requesting the large blob on every packet
 			// (which otherwise floods the log and hammers the HID bus indefinitely).
 			XREAL_AIR_ERROR(hmd, "Failed to parse factory calibration — using default IMU calibration");
+		} else {
+			XREAL_AIR_DEBUG(hmd,
+			                "Factory calibration parsed: gyro_bias=[%.5f %.5f %.5f] accel_bias=[%.5f %.5f %.5f]",
+			                hmd->calibration.gyro_bias.x, hmd->calibration.gyro_bias.y,
+			                hmd->calibration.gyro_bias.z, hmd->calibration.accel_bias.x,
+			                hmd->calibration.accel_bias.y, hmd->calibration.accel_bias.z);
+			if (hmd->calibration.display_valid) {
+				XREAL_AIR_DEBUG(hmd,
+				                "Factory display: res=%dx%d per-eye FOVh: left=%.2f° right=%.2f° "
+				                "(hardcoded fallback is 46.00°)",
+				                hmd->calibration.display_res[0], hmd->calibration.display_res[1],
+				                (double)(hmd->calibration.display_fov_h[0] * 180.0 / M_PI),
+				                (double)(hmd->calibration.display_fov_h[1] * 180.0 / M_PI));
+			}
+			if (hmd->calibration.distortion_valid) {
+				XREAL_AIR_DEBUG(hmd,
+				                "Factory distortion meshes present: left %dx%d, right %dx%d "
+				                "(parsed but not yet wired into compute_distortion)",
+				                hmd->calibration.distortion_num_col[0], hmd->calibration.distortion_num_row[0],
+				                hmd->calibration.distortion_num_col[1],
+				                hmd->calibration.distortion_num_row[1]);
+			}
 		}
 
 		hmd->calibration_valid = true;
@@ -1000,8 +1038,22 @@ switch_display_mode(struct xreal_air_hmd *hmd, uint8_t display_mode)
 		info.display.w_pixels *= 2;
 	}
 
+	// Default: the driver's historical hardcoded per-eye horizontal FOV (~46°). This is what has
+	// been validated worn and looks good, so it stays the default.
 	info.fov[0] = (float)(46.0 * (M_PI / 180.0));
 	info.fov[1] = (float)(46.0 * (M_PI / 180.0));
+
+	// Opt-in: use the factory-derived per-eye horizontal FOV from the calibration blob's pinhole
+	// intrinsics (Air 2 Ultra ≈ 42.2°, notably tighter than the 46° default). This is physically
+	// the correct projection but changes the on-screen scale, and cannot be verified without wearing
+	// the glasses, so it is gated behind XREAL_AIR_USE_FACTORY_FOV to avoid an unverified visual
+	// regression. Requires the calibration to have been parsed already (see create_device wait).
+	if (getenv("XREAL_AIR_USE_FACTORY_FOV") && hmd->calibration.display_valid) {
+		info.fov[0] = hmd->calibration.display_fov_h[0];
+		info.fov[1] = hmd->calibration.display_fov_h[1];
+		XREAL_AIR_DEBUG(hmd, "Using factory per-eye FOVh: left=%.2f° right=%.2f°",
+		                (double)(info.fov[0] * 180.0 / M_PI), (double)(info.fov[1] * 180.0 / M_PI));
+	}
 
 	if (!u_device_setup_split_side_by_side(&hmd->base, &info)) {
 		XREAL_AIR_ERROR(hmd, "Failed to setup basic device info");
@@ -1273,6 +1325,16 @@ xreal_air_hmd_create_device(struct os_hid_device *sensor_device,
 	/*
 	 * Device setup.
 	 */
+
+	// When the factory-FOV opt-in is active, the geometry set up below needs the calibration to have
+	// been parsed first. The calibration is read asynchronously on the sensor thread (owns the sensor
+	// HID exclusively), so briefly wait for that one-shot parse to latch calibration_valid. This is
+	// skipped entirely by default, keeping normal startup untouched.
+	if (getenv("XREAL_AIR_USE_FACTORY_FOV")) {
+		for (int i = 0; i < 3000 && !hmd->calibration_valid; i++) {
+			os_nanosleep(U_TIME_1MS_IN_NS);
+		}
+	}
 
 	if (!switch_display_mode(hmd, hmd->state.display_mode)) {
 		goto cleanup;

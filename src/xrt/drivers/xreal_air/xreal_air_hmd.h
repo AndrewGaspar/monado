@@ -85,6 +85,21 @@ struct xreal_air_parsed_calibration
 	struct xrt_vec3 scale_mag;
 
 	float imu_noises[4];
+
+	//! True when the factory "display" object was parsed (Air 2 Ultra full blob). The per-eye
+	//! horizontal FOV below is then derived from the factory pinhole intrinsics k_*_display and
+	//! resolution; otherwise these are left zero and the driver falls back to a hardcoded FOV.
+	bool display_valid;
+	float display_fov_h[2];  //!< per-eye horizontal field of view, radians (index 0 = left, 1 = right)
+	float k_display[2][9];   //!< per-eye 3x3 pinhole intrinsics (row-major), for logging / future use
+	int display_res[2];      //!< display panel resolution [w, h]
+
+	//! True when the factory "display_distortion" object was parsed. Only the grid dimensions are
+	//! retained here; the full 32x18 mesh is not yet consumed (compute_distortion still uses the
+	//! identity mesh). Kept so a future pass can wire the meshes without re-deriving whether they exist.
+	bool distortion_valid;
+	int distortion_num_col[2];
+	int distortion_num_row[2];
 };
 
 /*!
