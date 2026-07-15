@@ -16,6 +16,7 @@
 #include "math/m_api.h"
 #include "math/m_imu_3dof.h"
 
+#include "util/u_debug.h"
 #include "util/u_device.h"
 #include "util/u_distortion_mesh.h"
 #include "util/u_trace_marker.h"
@@ -41,6 +42,17 @@
 
 #define SENSOR_HEAD 0xFD
 #define CONTROL_HEAD 0xFD
+
+/*
+ * Live-tunable A/B switches for the motion-judder work (both default ON):
+ *  - XREAL_AIR_ANGULAR_VELOCITY=false  -> stop publishing world-space angular velocity with each
+ *    IMU sample, which disables forward pose prediction (m_predict_relation falls back to holding
+ *    the latest orientation, the pre-fix behaviour).
+ *  - XREAL_AIR_SCANOUT_COMP=false      -> stop reporting the panel scanout info to the compositor,
+ *    which disables rolling-scanout (per-scanline pose) compensation.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_angular_velocity, "XREAL_AIR_ANGULAR_VELOCITY", true)
+DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_scanout_comp, "XREAL_AIR_SCANOUT_COMP", true)
 
 /*!
  * Private struct for the xreal_air device.
@@ -335,7 +347,23 @@ update_fusion(struct xreal_air_hmd *hmd, struct xreal_air_parsed_sample *sample,
 	os_mutex_lock(&hmd->device_mutex);
 	update_fusion_locked(hmd, sample, timestamp_ns);
 	rel.pose.orientation = hmd->fusion.rot; // We have no tracking, don't return a position.
+	struct xrt_vec3 gyro = hmd->read.gyro;  // Calibrated body-space angular rate (rad/s).
 	os_mutex_unlock(&hmd->device_mutex);
+
+	/*
+	 * Publish the angular velocity so consumers can predict the pose forward in time.
+	 * Without it m_relation_history_get() cannot extrapolate to a future photon
+	 * timestamp and every frame shows an orientation that is already ~10-20ms stale by
+	 * the time it is scanned out - the world visibly lags/stutters during head motion.
+	 * The gyro *is* the angular velocity (far less noisy than finite-differencing the
+	 * fused orientations); xrt_space_relation wants it in base (world) space, so rotate
+	 * the body-space rate by the current orientation.
+	 */
+	if (debug_get_bool_option_xreal_air_angular_velocity()) {
+		math_quat_rotate_derivative(&rel.pose.orientation, &gyro, &rel.angular_velocity);
+		rel.relation_flags = (enum xrt_space_relation_flags)(rel.relation_flags |
+		                                                     XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT);
+	}
 
 	m_relation_history_push(hmd->relation_hist, &rel, timestamp_ns);
 }
@@ -1295,6 +1323,43 @@ xreal_air_hmd_get_tracked_pose(struct xrt_device *xdev,
 	return XRT_SUCCESS;
 }
 
+static xrt_result_t
+xreal_air_hmd_get_compositor_info(struct xrt_device *xdev,
+                                  const struct xrt_device_compositor_mode *mode,
+                                  struct xrt_device_compositor_info *out_info)
+{
+	/*
+	 * The glasses' micro-OLED panels are rolling-scanout: rows light up as they arrive
+	 * over the DP link, top to bottom (both eyes in parallel - in the 3D SBS mode every
+	 * DP scanline carries the left- and right-eye halves of the same row, so the two
+	 * panels update the same row at the same time and one full-frame-height scanout
+	 * model covers both views).
+	 *
+	 * The native 3D SBS EDID DTD (Air 2 Ultra, measured on the real connector) is
+	 * 3840x1080@60 with vtotal 1125 (1080 active + 45 blanking), 67.5kHz line rate -
+	 * the active region therefore covers 1080/1125 = 0.96 of the frame period
+	 * (16.0ms of the 16.667ms frame at 60Hz). Express it as a fraction of the
+	 * compositor-provided frame interval so a future 90/120Hz mode stays roughly right.
+	 */
+	(void)xdev;
+
+	if (!debug_get_bool_option_xreal_air_scanout_comp()) {
+		// NONE + 0 makes the compositor skip compensation quietly (no per-frame warning).
+		(*out_info) = (struct xrt_device_compositor_info){
+		    .scanout_time_ns = 0,
+		    .scanout_direction = XRT_SCANOUT_DIRECTION_NONE,
+		};
+		return XRT_SUCCESS;
+	}
+
+	(*out_info) = (struct xrt_device_compositor_info){
+	    .scanout_time_ns = mode->frame_interval_ns * 1080 / 1125,
+	    .scanout_direction = XRT_SCANOUT_DIRECTION_TOP_TO_BOTTOM,
+	};
+
+	return XRT_SUCCESS;
+}
+
 static void
 xreal_air_hmd_destroy(struct xrt_device *xdev)
 {
@@ -1327,6 +1392,7 @@ xreal_air_hmd_create_device(struct os_hid_device *sensor_device,
 	hmd->base.get_tracked_pose = xreal_air_hmd_get_tracked_pose;
 	hmd->base.get_view_poses = u_device_get_view_poses;
 	hmd->base.get_presence = xreal_air_hmd_get_presence;
+	hmd->base.get_compositor_info = xreal_air_hmd_get_compositor_info;
 	hmd->base.compute_distortion = u_distortion_mesh_none;
 	hmd->base.destroy = xreal_air_hmd_destroy;
 	hmd->base.name = XRT_DEVICE_GENERIC_HMD;
@@ -1334,6 +1400,9 @@ xreal_air_hmd_create_device(struct os_hid_device *sensor_device,
 	hmd->base.inputs[0].name = XRT_INPUT_GENERIC_HEAD_POSE;
 	hmd->base.supported.orientation_tracking = true;
 	hmd->base.supported.position_tracking = false;
+	// Report the panels' rolling-scanout characteristics so the compositor can apply
+	// per-scanline pose compensation (see xreal_air_hmd_get_compositor_info).
+	hmd->base.supported.compositor_info = true;
 	// The control interface surfaces a real hardware wear signal (display on/off via
 	// the proximity sensor), so advertise user presence. This propagates to
 	// XrSystemUserPresencePropertiesEXT.supportsUserPresence (oxr_system.c).
