@@ -868,7 +868,12 @@ handle_control_display_toggled(struct xreal_air_hmd *hmd, const struct xreal_air
 	// State of display: this is the hardware proximity/wear signal. The Air 2 Ultra
 	// pushes this on every physical don (state != 0 -> "Open OLED 2D") / doff
 	// (state == 0 -> "Close OLED"). Drives user-presence via get_presence.
+	// NOTE: whether the firmware sends this event at all may depend on the display
+	// mode (2D vs 3D) — log the raw state so live sessions can tell.
 	const uint8_t display_state = control->data[0];
+
+	XREAL_AIR_DEBUG(hmd, "Display toggled event: state=0x%02x -> display_on=%s", display_state,
+	                display_state != 0 ? "true" : "false");
 
 	xreal_air_set_display_on(hmd, display_state != 0);
 }

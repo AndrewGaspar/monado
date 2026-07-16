@@ -457,6 +457,8 @@ poll_and_broadcast_presence(struct multi_system_compositor *msc)
 	msc->last_presence = presence;
 	msc->presence_valid = true;
 
+	U_LOG_I("User presence changed: %s — broadcasting to clients.", presence ? "present" : "absent");
+
 	union xrt_session_event xse = XRT_STRUCT_INIT;
 	xse.type = XRT_SESSION_EVENT_USER_PRESENCE_CHANGE;
 	xse.presence_change.is_user_present = presence;
