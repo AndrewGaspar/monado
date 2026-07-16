@@ -726,7 +726,12 @@ sensor_read_one_packet(struct xreal_air_hmd *hmd)
 		buffer_size = hmd->max_sensor_buffer_size;
 	}
 
-	int size = os_hid_read(hmd->hid_sensor, buffer, buffer_size, 0);
+	// Block up to 10ms instead of polling (0): the read thread's loop otherwise busy-spins
+	// a whole CPU core — always noticeable, glaring when the glasses are doffed and BOTH
+	// interfaces go silent. Worn, the 1kHz IMU wakes this immediately; doffed, the loop
+	// degrades to a 100Hz control-interface check (don detection stays well under the
+	// presence debounce). Control-packet handling is delayed by at most this timeout.
+	int size = os_hid_read(hmd->hid_sensor, buffer, buffer_size, 10);
 	if (size <= 0) {
 		return size;
 	}
