@@ -351,6 +351,24 @@ struct multi_system_compositor
 	//! Whether @ref last_presence holds a value yet (false before the first poll).
 	bool presence_valid;
 
+	/*!
+	 * Dedicated user-presence poll thread. When @ref head_xdev is presence-capable
+	 * and the poll is not disabled by env, presence is sampled here on a fixed cadence
+	 * instead of once per native frame — so live don/doff still reaches clients when the
+	 * render loop is blocked (e.g. DRM-lease direct mode with the OLED off: no vblank →
+	 * the pacer stalls → the per-frame poll would never run). See @ref presence_thread_started.
+	 */
+	struct os_thread_helper presence_oth;
+
+	/*!
+	 * True when @ref presence_oth is running and owns presence polling. While true the
+	 * per-frame poll in the render loop is skipped (avoids double-broadcast); while false
+	 * (no presence-capable head device, or disabled by env) the render loop keeps polling
+	 * per frame as before. @ref last_presence / @ref presence_valid are only ever touched by
+	 * the single active path, so they need no extra lock.
+	 */
+	bool presence_thread_started;
+
 	//! Render loop thread.
 	struct os_thread_helper oth;
 

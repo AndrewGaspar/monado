@@ -55,6 +55,23 @@
  */
 DEBUG_GET_ONCE_BOOL_OPTION(thread_realtime, "XRT_COMPOSITOR_THREAD_REALTIME", false)
 
+/*
+ * Decouple the user-presence (XR_EXT_user_presence) poll from the native render loop.
+ *
+ * By default presence is sampled on a dedicated low-cadence thread instead of once per
+ * native frame. The per-frame poll starves whenever the render loop blocks — most notably
+ * DRM-lease direct mode: doffing the glasses turns the OLED off, no vblank is produced, the
+ * fake pacer that phase-locks to VK_EXT_display_control FIRST_PIXEL_OUT events stalls, and the
+ * multi main loop stops iterating, so the doff (presence=false) event never fires. A separate
+ * timer thread keeps sampling regardless of frame pumping. Set this false to fall back to the
+ * old per-frame poll. Only ever matters when the head device advertises presence support.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(presence_poll, "XRT_COMPOSITOR_PRESENCE_POLL", true)
+
+//! Cadence of the dedicated user-presence poll thread. Comfortably above the driver's
+//! ~400ms don/doff debounce, well below human don/doff timescales.
+#define MSC_PRESENCE_POLL_MS 150
+
 
 /*
  *
@@ -413,7 +430,11 @@ broadcast_timings_to_pacers(struct multi_system_compositor *msc,
  * is only read once at session begin) — it fixes live presence for any
  * presence-capable driver (XReal, Rift CV1, PSVR2, ...). No-op and near-free when no
  * presence-capable head device is bound (@ref multi_system_compositor::head_xdev is
- * NULL). Called once per native frame on the multi main loop thread.
+ * NULL). Called either from the dedicated presence poll thread (@ref multi_presence_loop,
+ * the default) or, when that is disabled, once per native frame on the multi main loop
+ * thread. Exactly one of those two callers is ever active, so @ref last_presence /
+ * @ref presence_valid need no lock; the broadcast itself takes list_and_timing_lock, the
+ * same lock and call path the render loop already uses.
  */
 static void
 poll_and_broadcast_presence(struct multi_system_compositor *msc)
@@ -453,6 +474,68 @@ poll_and_broadcast_presence(struct multi_system_compositor *msc)
 		}
 	}
 	os_mutex_unlock(&msc->list_and_timing_lock);
+}
+
+/*!
+ * Dedicated user-presence poll thread. Samples the head device every @ref MSC_PRESENCE_POLL_MS
+ * and broadcasts on change, decoupled from the render loop so live don/doff still reaches
+ * clients when the render loop is blocked (see @ref presence_poll and @ref presence_thread_started).
+ *
+ * Only takes @ref multi_system_compositor::presence_oth (this thread's own helper) and, briefly,
+ * @ref multi_system_compositor::list_and_timing_lock inside @ref poll_and_broadcast_presence — the
+ * exact lock the render loop already uses for the same broadcast. It never takes the render loop's
+ * @ref multi_system_compositor::oth, and the render loop never takes this thread's presence_oth, so
+ * there is no lock-order relationship between the two threads. The render loop holds
+ * list_and_timing_lock only for short critical sections and is never blocked-on-vblank while holding
+ * it, so this poll can always acquire it — a blocked (display-off) render loop cannot deadlock it.
+ */
+static int
+multi_presence_loop(struct multi_system_compositor *msc)
+{
+	struct os_thread_helper *oth = &msc->presence_oth;
+
+	os_thread_helper_name(oth, "Presence poll");
+
+	os_thread_helper_lock(oth);
+
+	while (os_thread_helper_is_running_locked(oth)) {
+
+		// Wait out the cadence, but wake immediately when asked to stop
+		// (os_thread_helper_stop_and_wait() clears running and signals cond).
+		int64_t deadline_ns = os_realtime_get_ns();
+		const int64_t period_ns = (int64_t)MSC_PRESENCE_POLL_MS * U_TIME_1MS_IN_NS;
+		if (deadline_ns <= INT64_MAX - period_ns) {
+			deadline_ns += period_ns;
+		} else {
+			deadline_ns = INT64_MAX;
+		}
+
+		struct timespec spec;
+		os_ns_to_timespec(deadline_ns, &spec);
+		pthread_cond_timedwait(&oth->cond, &oth->mutex, &spec);
+
+		if (!os_thread_helper_is_running_locked(oth)) {
+			break;
+		}
+
+		// Drop our own lock across the poll+broadcast: it takes the system's
+		// list_and_timing_lock, which must not be nested under presence_oth.
+		os_thread_helper_unlock(oth);
+
+		poll_and_broadcast_presence(msc);
+
+		os_thread_helper_lock(oth);
+	}
+
+	os_thread_helper_unlock(oth);
+
+	return 0;
+}
+
+static void *
+presence_thread_func(void *ptr)
+{
+	return (void *)(intptr_t)multi_presence_loop((struct multi_system_compositor *)ptr);
 }
 
 static void
@@ -619,8 +702,11 @@ multi_main_loop(struct multi_system_compositor *msc)
 
 		// Poll the head device for a don/doff (user-presence) change and, on a
 		// change, broadcast it to all clients. Near-free when no presence-capable
-		// device is bound.
-		poll_and_broadcast_presence(msc);
+		// device is bound. Skipped when the dedicated presence poll thread owns this
+		// (the default for presence-capable devices) — see multi_presence_loop().
+		if (!msc->presence_thread_started) {
+			poll_and_broadcast_presence(msc);
+		}
 
 		// Re-lock the thread for check in while statement.
 		os_thread_helper_lock(&msc->oth);
@@ -788,6 +874,13 @@ system_compositor_destroy(struct xrt_system_compositor *xsc)
 {
 	struct multi_system_compositor *msc = multi_system_compositor(xsc);
 
+	// Stop and join the presence poll thread before anything it touches goes away: it
+	// broadcasts under list_and_timing_lock (destroyed below) into the clients, so it must
+	// be fully stopped before that lock, the clients, or the head device are torn down.
+	// Always initialized in create (even when the thread was never started), so this is
+	// unconditionally safe — stop_and_wait() is a no-op when it isn't running.
+	os_thread_helper_destroy(&msc->presence_oth);
+
 	// Destroy the render thread first, destroy also stops the thread.
 	os_thread_helper_destroy(&msc->oth);
 
@@ -852,6 +945,7 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 	msc->head_xdev = (head_xdev != NULL && head_xdev->supported.presence) ? head_xdev : NULL;
 	msc->presence_valid = false;
 	msc->last_presence = false;
+	msc->presence_thread_started = false;
 	msc->sessions.active_count = 0;
 	msc->sessions.state = do_warm_start ? MULTI_SYSTEM_STATE_INIT_WARM_START : MULTI_SYSTEM_STATE_STOPPED;
 
@@ -869,6 +963,24 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 	}
 
 	os_thread_helper_start(&msc->oth, thread_func, msc);
+
+	// Decoupled user-presence poll. Always init the helper so destroy can tear it down
+	// unconditionally, but only spin the thread for a presence-capable head device (never
+	// for null/WiVRn) and only when not disabled by env.
+	ret = os_thread_helper_init(&msc->presence_oth);
+	if (ret < 0) {
+		return XRT_ERROR_THREADING_INIT_FAILURE;
+	}
+	if (msc->head_xdev != NULL) {
+		if (debug_get_bool_option_presence_poll()) {
+			os_thread_helper_start(&msc->presence_oth, presence_thread_func, msc);
+			msc->presence_thread_started = true;
+			U_LOG_I("User-presence poll: dedicated thread, every %d ms.", MSC_PRESENCE_POLL_MS);
+		} else {
+			U_LOG_I("User-presence poll: dedicated thread disabled by "
+			        "XRT_COMPOSITOR_PRESENCE_POLL=false, polling per frame.");
+		}
+	}
 
 	*out_xsysc = &msc->base;
 
