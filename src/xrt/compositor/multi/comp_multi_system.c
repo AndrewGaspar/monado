@@ -45,6 +45,18 @@
 
 
 /*
+ * Gate the SCHED_FIFO (priority 99) promotion of the multi-client render thread.
+ *
+ * u_linux_try_to_set_realtime_priority_on_thread() raises this thread to the
+ * maximum realtime priority. That only succeeds once the process has CAP_SYS_NICE
+ * (e.g. monado-service with cap_sys_nice+ep), and a priority-99 SCHED_FIFO thread
+ * can starve the rest of the machine. Companion to the Vulkan global-priority cap
+ * in comp_vulkan.c (2026-07-15 shared-iGPU starvation incident). Default: off.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(thread_realtime, "XRT_COMPOSITOR_THREAD_REALTIME", false)
+
+
+/*
  *
  * Render thread.
  *
@@ -533,8 +545,15 @@ multi_main_loop(struct multi_system_compositor *msc)
 	os_thread_helper_name(&msc->oth, "Multi Client Module");
 
 #ifdef XRT_OS_LINUX
-	// Try to raise priority of this thread.
-	u_linux_try_to_set_realtime_priority_on_thread(U_LOGGING_INFO, "Multi Client Module");
+	// Try to raise priority of this thread -- but only when explicitly opted in. A
+	// SCHED_FIFO priority-99 thread on a cap_sys_nice binary can starve the whole
+	// machine (see XRT_COMPOSITOR_THREAD_REALTIME above).
+	if (debug_get_bool_option_thread_realtime()) {
+		u_linux_try_to_set_realtime_priority_on_thread(U_LOGGING_INFO, "Multi Client Module");
+	} else {
+		U_LOG_I("Multi Client Module: SCHED_FIFO promotion skipped "
+		        "(set XRT_COMPOSITOR_THREAD_REALTIME=true to enable).");
+	}
 #endif
 
 	struct xrt_compositor *xc = &msc->xcn->base;

@@ -13,10 +13,13 @@
 
 #include "os/os_time.h"
 
+#include "util/u_debug.h"
 #include "util/u_handles.h"
 #include "util/u_trace_marker.h"
 
 #include "util/comp_vulkan.h"
+
+#include <string.h>
 
 
 /*
@@ -250,6 +253,23 @@ create_instance(struct vk_bundle *vk, const struct comp_vulkan_arguments *vk_arg
 	return ret;
 }
 
+/*
+ * Cap the maximum Vulkan queue global priority the compositor may request.
+ *
+ * A monado-service binary that carries cap_sys_nice can successfully request a
+ * REALTIME (or HIGH) global priority. On a shared iGPU -- the same GPU that
+ * drives the desktop -- a REALTIME graphics queue can starve the whole system.
+ * This bit us on 2026-07-15: with cap_sys_nice live, XReal direct-mode system
+ * creation fail-looped and each retry created a REALTIME queue on the desktop
+ * iGPU, hitching the entire machine until a hard reboot. So the cap defaults to
+ * MEDIUM and REALTIME/HIGH are strictly opt-in.
+ *
+ * Accepts "realtime", "high" or "medium"; anything else falls back to medium.
+ * The fallback walk down the priority list (below) is unchanged -- this only
+ * chooses where that walk starts.
+ */
+DEBUG_GET_ONCE_OPTION(vk_global_priority, "XRT_COMPOSITOR_VK_GLOBAL_PRIORITY", "medium")
+
 static VkResult
 create_device(struct vk_bundle *vk, const struct comp_vulkan_arguments *vk_args)
 {
@@ -266,6 +286,25 @@ create_device(struct vk_bundle *vk, const struct comp_vulkan_arguments *vk_args)
 	    VK_QUEUE_GLOBAL_PRIORITY_HIGH_EXT,     // Probably not as good but something.
 	    VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_EXT,   // Default fallback.
 	};
+
+	// Cap the maximum priority we may request (see XRT_COMPOSITOR_VK_GLOBAL_PRIORITY above).
+	// prios[]/prio_strs[] are ordered REALTIME(0) -> HIGH(1) -> MEDIUM(2); the cap picks the
+	// first index the fallback walk is allowed to start from. Default: MEDIUM (index 2).
+	size_t prio_start = 2;
+	const char *prio_cap = debug_get_option_vk_global_priority();
+	if (prio_cap != NULL && strcmp(prio_cap, "realtime") == 0) {
+		prio_start = 0;
+	} else if (prio_cap != NULL && strcmp(prio_cap, "high") == 0) {
+		prio_start = 1;
+	} else if (prio_cap != NULL && strcmp(prio_cap, "medium") == 0) {
+		prio_start = 2;
+	} else {
+		VK_WARN(vk, "XRT_COMPOSITOR_VK_GLOBAL_PRIORITY='%s' not recognized (realtime|high|medium); using medium.",
+		        prio_cap != NULL ? prio_cap : "(null)");
+		prio_start = 2;
+	}
+	VK_INFO(vk, "Vulkan queue global-priority cap: %s (XRT_COMPOSITOR_VK_GLOBAL_PRIORITY).",
+	        prio_strs[prio_start]);
 
 	const bool only_compute_queue = vk_args->only_compute_queue;
 
@@ -287,7 +326,7 @@ create_device(struct vk_bundle *vk, const struct comp_vulkan_arguments *vk_args)
 	}
 
 	// No other way then to try to see if realtime is available.
-	for (size_t i = 0; i < ARRAY_SIZE(prios); i++) {
+	for (size_t i = prio_start; i < ARRAY_SIZE(prios); i++) {
 		ret = vk_create_device(                  //
 		    vk,                                  //
 		    vk_args->selected_gpu_index,         //
