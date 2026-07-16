@@ -964,10 +964,17 @@ handle_control_button(struct xreal_air_hmd *hmd, const struct xreal_air_parsed_c
 static void
 handle_control_async_text(struct xreal_air_hmd *hmd, const struct xreal_air_parsed_control *control)
 {
-	// Event only appears if the display is active!
-	xreal_air_set_display_on(hmd, true);
+	const char *text = (const char *)control->data;
 
-	XREAL_AIR_DEBUG(hmd, "Control message: %s", (const char *)control->data);
+	// Upstream assumed any async text log implies the display is active ("Event only
+	// appears if the display is active!"). The Air 2 Ultra disproves that: on doff it
+	// sends the "Close OLED" text ~2s AFTER the display turned off (and after the
+	// 0x6C04 DISPLAY_TOGGLED state event already reported it), which flipped display_on
+	// back to true and cancelled the user-absent presence edge. Treat the OLED texts as
+	// the state they announce; any other text keeps the active-display assumption.
+	xreal_air_set_display_on(hmd, strncmp(text, "Close OLED", strlen("Close OLED")) != 0);
+
+	XREAL_AIR_DEBUG(hmd, "Control message: %s", text);
 }
 
 static void
