@@ -39,6 +39,8 @@ struct os_hid_device
 
 	int (*get_physical_address)(struct os_hid_device *hid_dev, uint8_t *data, size_t size);
 
+	int (*get_fd)(struct os_hid_device *hid_dev);
+
 	void (*destroy)(struct os_hid_device *hid_dev);
 };
 
@@ -65,6 +67,22 @@ static inline int
 os_hid_write(struct os_hid_device *hid_dev, const uint8_t *data, size_t size)
 {
 	return hid_dev->write(hid_dev, data, size);
+}
+
+/*!
+ * Get a pollable file descriptor for the given hid device, or -1 when the
+ * backend has none. Lets a driver reading several interfaces block in one
+ * poll(2) across all of them instead of looping non-blocking reads.
+ *
+ * @public @memberof os_hid_device
+ */
+static inline int
+os_hid_get_fd(struct os_hid_device *hid_dev)
+{
+	if (hid_dev->get_fd == NULL) {
+		return -1;
+	}
+	return hid_dev->get_fd(hid_dev);
 }
 
 /*!

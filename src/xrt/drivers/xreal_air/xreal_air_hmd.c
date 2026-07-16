@@ -28,6 +28,8 @@
 #include "math/m_relation_history.h"
 #include "xrt/xrt_defines.h"
 
+#include <errno.h>
+#include <poll.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -726,12 +728,7 @@ sensor_read_one_packet(struct xreal_air_hmd *hmd)
 		buffer_size = hmd->max_sensor_buffer_size;
 	}
 
-	// Block up to 10ms instead of polling (0): the read thread's loop otherwise busy-spins
-	// a whole CPU core — always noticeable, glaring when the glasses are doffed and BOTH
-	// interfaces go silent. Worn, the 1kHz IMU wakes this immediately; doffed, the loop
-	// degrades to a 100Hz control-interface check (don detection stays well under the
-	// presence debounce). Control-packet handling is delayed by at most this timeout.
-	int size = os_hid_read(hmd->hid_sensor, buffer, buffer_size, 10);
+	int size = os_hid_read(hmd->hid_sensor, buffer, buffer_size, 0);
 	if (size <= 0) {
 		return size;
 	}
@@ -751,6 +748,16 @@ read_thread(void *ptr)
 	struct xreal_air_hmd *hmd = (struct xreal_air_hmd *)ptr;
 	int ret = 0;
 
+	// Event-driven reads: block in ONE poll(2) across both HID interfaces and only wake on
+	// actual data. The upstream loop did non-blocking reads of both interfaces with no sleep,
+	// pegging a whole CPU core for the life of the device (pure spin while doffed, when both
+	// interfaces go silent). The 1s guard timeout only bounds shutdown latency — a stop
+	// request is noticed at the next wake. Falls back to a paced non-blocking loop if the
+	// os_hid backend exposes no fd (only hidraw does today).
+	const int sensor_fd = os_hid_get_fd(hmd->hid_sensor);
+	const int control_fd = os_hid_get_fd(hmd->hid_control);
+	const bool have_fds = sensor_fd >= 0 && control_fd >= 0;
+
 	os_thread_helper_lock(&hmd->oth);
 
 	request_sensor_control_start_imu_data(hmd, 0xAA);
@@ -758,10 +765,37 @@ read_thread(void *ptr)
 	while (os_thread_helper_is_running_locked(&hmd->oth) && ret >= 0) {
 		os_thread_helper_unlock(&hmd->oth);
 
-		ret = read_one_control_packet(hmd);
+		bool control_ready = true;
+		bool sensor_ready = true;
 
-		if (ret >= 0) {
+		if (have_fds) {
+			struct pollfd fds[2] = {
+			    {.fd = control_fd, .events = POLLIN, .revents = 0},
+			    {.fd = sensor_fd, .events = POLLIN, .revents = 0},
+			};
+
+			int n = poll(fds, 2, 1000);
+			if (n < 0 && errno != EINTR) {
+				ret = -1; // Poll error, bail like a failed read.
+			}
+			if ((fds[0].revents | fds[1].revents) & (POLLERR | POLLHUP | POLLNVAL)) {
+				ret = -1; // Device disconnect.
+			}
+			control_ready = n > 0 && (fds[0].revents & POLLIN) != 0;
+			sensor_ready = n > 0 && (fds[1].revents & POLLIN) != 0;
+		}
+
+		if (ret >= 0 && control_ready) {
+			ret = read_one_control_packet(hmd);
+		}
+
+		if (ret >= 0 && sensor_ready) {
 			ret = sensor_read_one_packet(hmd);
+		}
+
+		if (!have_fds) {
+			// No pollable fds: pace the non-blocking loop instead of spinning.
+			os_nanosleep(U_TIME_1MS_IN_NS * 10);
 		}
 
 		os_thread_helper_lock(&hmd->oth);

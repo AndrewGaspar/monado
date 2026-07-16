@@ -135,6 +135,14 @@ os_hidraw_destroy(struct os_hid_device *ohdev)
 	free(hrdev);
 }
 
+static int
+os_hidraw_get_fd(struct os_hid_device *ohdev)
+{
+	struct hid_hidraw *hrdev = (struct hid_hidraw *)ohdev;
+
+	return hrdev->fd;
+}
+
 int
 os_hid_open_hidraw(const char *path, struct os_hid_device **out_hid)
 {
@@ -146,6 +154,7 @@ os_hid_open_hidraw(const char *path, struct os_hid_device **out_hid)
 	hrdev->base.get_feature_timeout = os_hidraw_get_feature_timeout;
 	hrdev->base.set_feature = os_hidraw_set_feature;
 	hrdev->base.get_physical_address = os_hidraw_get_physical_address;
+	hrdev->base.get_fd = os_hidraw_get_fd;
 	hrdev->base.destroy = os_hidraw_destroy;
 	hrdev->fd = open(path, O_RDWR);
 	if (hrdev->fd < 0) {
