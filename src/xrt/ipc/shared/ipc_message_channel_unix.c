@@ -18,6 +18,8 @@
 #include "util/u_logging.h"
 #include "util/u_pretty_print.h"
 
+#include "os/os_time.h"
+
 #include "shared/ipc_protocol.h"
 #include "shared/ipc_message_channel.h"
 
@@ -28,6 +30,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <assert.h>
+#include <poll.h>
 
 
 /*
@@ -57,6 +60,116 @@ union imcontrol_buf {
 
 /*
  *
+ * Bounded receive helper (client-side deadlock guard, HypXRland task #89).
+ *
+ */
+
+/*!
+ * Slice length (ms) used when polling an unbounded (wait-class) receive, so we
+ * loop back often enough to notice a dead socket even while legitimately
+ * blocking forever.
+ */
+#define IPC_UNBOUNDED_POLL_SLICE_MS 1000
+
+/*!
+ * Wait for @p imc->ipc_handle to become readable before we call recvmsg().
+ *
+ * Behavior is driven entirely by fields on the channel, all zero on the server
+ * (so the server keeps its historical infinite-block semantics):
+ *
+ * - If the channel is already marked failed, fail immediately.
+ * - If timeout_ms <= 0 (disabled) or waiting_unbounded is set, poll forever in
+ *   slices, returning success as soon as the fd is readable/hung-up (recvmsg
+ *   then surfaces the data or the EOF). This detects a dead service even for
+ *   the wait-class calls that may legitimately block for a long time.
+ * - Otherwise wait at most timeout_ms across the whole call; on expiry, log
+ *   loudly to stderr, mark the connection dead, and fail so the caller (and
+ *   every subsequent call) fails fast instead of freezing forever.
+ */
+static xrt_result_t
+ipc_channel_wait_readable(struct ipc_message_channel *imc)
+{
+	if (imc->failed) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	const bool unbounded = imc->waiting_unbounded || imc->timeout_ms <= 0;
+
+	// Absolute deadline for the bounded case.
+	const uint64_t start_ns = unbounded ? 0 : os_monotonic_get_ns();
+	const uint64_t budget_ns = unbounded ? 0 : (uint64_t)imc->timeout_ms * (uint64_t)U_TIME_1MS_IN_NS;
+
+	for (;;) {
+		int wait_ms;
+		if (unbounded) {
+			wait_ms = IPC_UNBOUNDED_POLL_SLICE_MS;
+		} else {
+			uint64_t now_ns = os_monotonic_get_ns();
+			uint64_t elapsed_ns = now_ns - start_ns;
+			if (elapsed_ns >= budget_ns) {
+				wait_ms = 0;
+			} else {
+				uint64_t remain_ms = (budget_ns - elapsed_ns) / U_TIME_1MS_IN_NS;
+				wait_ms = remain_ms > INT32_MAX ? INT32_MAX : (int)remain_ms;
+			}
+		}
+
+		struct pollfd pfd = {
+		    .fd = imc->ipc_handle,
+		    .events = POLLIN,
+		    .revents = 0,
+		};
+
+		int pret = poll(&pfd, 1, wait_ms);
+		if (pret > 0) {
+			// Readable, or POLLHUP/POLLERR — let recvmsg surface it.
+			return XRT_SUCCESS;
+		}
+		if (pret < 0) {
+			if (errno == EINTR) {
+				// Interrupted; re-evaluate remaining budget.
+				continue;
+			}
+			IPC_ERROR(imc, "poll(%i) failed: '%s'! Marking connection dead.", (int)imc->ipc_handle,
+			          strerror(errno));
+			imc->failed = true;
+			return XRT_ERROR_IPC_FAILURE;
+		}
+
+		// pret == 0: this poll slice expired.
+		if (unbounded) {
+			// A live-but-idle socket just times out with no revents; a
+			// dead one becomes readable (POLLHUP) and takes the pret>0
+			// path above. So keep waiting.
+			continue;
+		}
+
+		// Bounded receive whose whole budget is spent: the service never
+		// replied. Fail loudly and poison the connection so a late reply
+		// can never be mis-delivered to the next call.
+		imc->failed = true;
+
+		const char *name = imc->cmd_name != NULL ? imc->cmd_name : "<unknown>";
+		IPC_ERROR(imc,
+		          "IPC TIMEOUT: monado-service did not reply to command '%s' within %i ms; "
+		          "marking connection dead. (task #89 deadlock guard; tune/disable with "
+		          "XRT_IPC_CLIENT_TIMEOUT_MS)",
+		          name, imc->timeout_ms);
+		// Also emit directly to stderr, unconditionally: this is the sink
+		// that survives a compositor freeze and lands in the journal.
+		fprintf(stderr,
+		        "[monado-ipc] TIMEOUT: no reply from monado-service for IPC command '%s' after %d ms; "
+		        "connection marked dead (XRT_IPC_CLIENT_TIMEOUT_MS)\n",
+		        name, imc->timeout_ms);
+		fflush(stderr);
+
+		return XRT_ERROR_IPC_FAILURE;
+	}
+}
+
+
+/*
+ *
  * 'Exported' functions.
  *
  */
@@ -74,6 +187,12 @@ ipc_message_channel_close(struct ipc_message_channel *imc)
 xrt_result_t
 ipc_send(struct ipc_message_channel *imc, const void *data, size_t size)
 {
+	// Connection was poisoned by an earlier timeout: fail fast so we never
+	// push a new command onto a stream that may still hold a stale reply.
+	if (imc->failed) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
 	struct msghdr msg = {0};
 	struct iovec iov = {0};
 
@@ -99,6 +218,13 @@ ipc_send(struct ipc_message_channel *imc, const void *data, size_t size)
 xrt_result_t
 ipc_receive(struct ipc_message_channel *imc, void *out_data, size_t size)
 {
+	// Bounded wait: fail (and poison the connection) if the service does not
+	// answer in time, instead of blocking recvmsg() forever.
+	xrt_result_t wret = ipc_channel_wait_readable(imc);
+	if (wret != XRT_SUCCESS) {
+		return wret;
+	}
+
 	// wait for the response
 	struct iovec iov = {0};
 	struct msghdr msg = {0};
@@ -137,6 +263,13 @@ ipc_receive_fds(struct ipc_message_channel *imc, void *out_data, size_t size, in
 	assert(size != 0);
 	assert(out_handles != NULL);
 	assert(handle_count != 0);
+
+	// Bounded wait (same guard as ipc_receive): the fd-passing reply path is
+	// exactly what the OpenXR session bring-up funnels through.
+	xrt_result_t wret = ipc_channel_wait_readable(imc);
+	if (wret != XRT_SUCCESS) {
+		return wret;
+	}
 
 	union imcontrol_buf u;
 	const size_t fds_size = sizeof(int) * handle_count;

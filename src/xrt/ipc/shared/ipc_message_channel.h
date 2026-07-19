@@ -30,6 +30,44 @@ struct ipc_message_channel
 {
 	xrt_ipc_handle_t ipc_handle;
 	enum u_logging_level log_level;
+
+	/*!
+	 * Client-side receive timeout, in milliseconds. `<= 0` means disabled
+	 * (block forever, the historical behavior). The server never sets this
+	 * (its state is zero-initialized), so the server keeps blocking
+	 * semantics. When set (by the client, from XRT_IPC_CLIENT_TIMEOUT_MS),
+	 * a bounded receive fails the call and marks the connection dead if the
+	 * service does not reply in time. See ipc_message_channel_unix.c.
+	 *
+	 * @see HypXRland task #89 (direct-mode session-startup deadlock).
+	 */
+	int timeout_ms;
+
+	/*!
+	 * Per-call flag: when true the next bounded receive on this channel is
+	 * allowed to wait forever (it only ever fails if the socket dies). Set
+	 * by the generated client proxy for "wait-class" calls (the compositor
+	 * wait-frame path and swapchain wait-image) that legitimately block for
+	 * unbounded periods — e.g. across doffed periods in direct mode. Reset
+	 * to false for every other (bring-up class) call, which then hard-fails
+	 * after @ref timeout_ms.
+	 */
+	bool waiting_unbounded;
+
+	/*!
+	 * Sticky flag: set once a bounded receive has timed out (or a fatal
+	 * poll error occurred). A late reply that arrives after we gave up must
+	 * never be mis-delivered to the following call, so once this is set all
+	 * further sends/receives fail fast and the session is abandoned.
+	 */
+	bool failed;
+
+	/*!
+	 * Name of the IPC command currently in flight, set by the generated
+	 * client proxy so a timeout can name the offending call in its log.
+	 * May be NULL.
+	 */
+	const char *cmd_name;
 };
 
 /*!

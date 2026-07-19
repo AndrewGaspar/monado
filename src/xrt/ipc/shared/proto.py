@@ -13,6 +13,30 @@ from ipcproto.common import (Proto, write_decl, write_invocation,
                              write_cpp_header_guard_end, write_msg_struct,
                              write_reply_struct, write_msg_send)
 
+# HypXRland task #89 — direct-mode session-startup deadlock guard.
+#
+# "Wait-class" IPC calls legitimately block for long, unbounded periods and MUST
+# NOT be torn down by the client-side receive timeout — otherwise a healthy
+# session would be killed every time the user doffs the glasses in direct mode
+# (display off, pacer stalled). These calls instead retry the bounded receive
+# forever, still detecting a genuinely dead socket. Every other call (the
+# bring-up class that froze Hyprland) hard-fails after XRT_IPC_CLIENT_TIMEOUT_MS.
+#
+#   compositor_predict_frame  xrWaitFrame: the compositor pacer decides the
+#                             wake-up time; stalls across doffed periods.
+#   compositor_wait_woke      xrWaitFrame handshake tail on the same stalled
+#                             render loop; only reached after predict_frame.
+#   swapchain_wait_image      xrWaitSwapchainImage: blocks up to the app's
+#                             (possibly infinite) timeout_ns for the image.
+#
+# All three are on the per-frame render path, never on session bring-up.
+WAIT_CLASS_CALLS = frozenset((
+    "compositor_predict_frame",
+    "compositor_wait_woke",
+    "swapchain_wait_image",
+))
+
+
 header = '''// Copyright 2020-2023, Collabora, Ltd.
 // SPDX-License-Identifier: BSL-1.0
 /*!
@@ -45,6 +69,11 @@ def write_receive_definition(f, call):
 
     write_reply_struct(f, call, '\t')
 
+    # Deadlock guard (task #89): varlen calls are all bring-up class (never
+    # wait-class). Caller holds the connection lock around send/receive.
+    f.write("\n\tipc_c->imc.cmd_name = \"" + call.name + "\";\n")
+    f.write("\tipc_c->imc.waiting_unbounded = false;\n")
+
     f.write("\n\t// Await the reply")
     func = 'ipc_receive'
     args = ['&ipc_c->imc', '&_reply', 'sizeof(_reply)']
@@ -73,6 +102,13 @@ def write_call_definition(f, call):
 \tos_mutex_lock(&ipc_c->mutex);
 """)
     cleanup = "os_mutex_unlock(&ipc_c->mutex);"
+
+    # Deadlock guard (task #89): tag the in-flight command and whether it may
+    # block unboundedly, so the bounded receive can classify it. Set under the
+    # lock, covering both the fd-sync receive and the reply receive below.
+    wait = "true" if call.name in WAIT_CLASS_CALLS else "false"
+    f.write("\tipc_c->imc.cmd_name = \"" + call.name + "\";\n")
+    f.write("\tipc_c->imc.waiting_unbounded = " + wait + ";\n")
 
     # Prepare initial sending
     write_msg_send(f, 'xrt_result_t ret', indent="\t")

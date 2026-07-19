@@ -57,6 +57,20 @@
 
 DEBUG_GET_ONCE_BOOL_OPTION(ipc_ignore_version, "IPC_IGNORE_VERSION", false)
 
+/*
+ * Client-side IPC receive timeout, in milliseconds (HypXRland task #89).
+ *
+ * The OpenXR session bring-up (xrCreateSession, swapchain-format query, space
+ * creation, action attach, ...) runs as synchronous IPC on the caller's thread.
+ * In DRM-lease direct mode a sick DP link can stall monado-service mid bring-up
+ * and, because the service is coupled to the very compositor that is blocked
+ * waiting on it, the caller froze forever. This bounds every non-wait-class
+ * call: if the service does not reply within the timeout the call fails and the
+ * connection is marked dead. 0 disables the timeout (historical infinite block,
+ * useful for bisecting). Default 5000 ms.
+ */
+DEBUG_GET_ONCE_NUM_OPTION(ipc_client_timeout_ms, "XRT_IPC_CLIENT_TIMEOUT_MS", 5000)
+
 #ifdef XRT_OS_ANDROID
 
 static bool
@@ -396,6 +410,20 @@ ipc_client_connection_init(struct ipc_connection *ipc_c,
 		          "###");
 		os_mutex_destroy(&ipc_c->mutex);
 		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	// Arm the client-side receive timeout now that the socket is connected
+	// (server-side channels never touch this field and keep blocking
+	// semantics). Clamp negatives to 0 = disabled.
+	{
+		long t = debug_get_num_option_ipc_client_timeout_ms();
+		ipc_c->imc.timeout_ms = t < 0 ? 0 : (t > INT_MAX ? INT_MAX : (int)t);
+		if (ipc_c->imc.timeout_ms > 0) {
+			IPC_INFO(ipc_c, "IPC client receive timeout armed: %i ms (XRT_IPC_CLIENT_TIMEOUT_MS)",
+			         ipc_c->imc.timeout_ms);
+		} else {
+			IPC_INFO(ipc_c, "IPC client receive timeout disabled (XRT_IPC_CLIENT_TIMEOUT_MS=0)");
+		}
 	}
 
 	// Do this first so we can use it to check git tags.
