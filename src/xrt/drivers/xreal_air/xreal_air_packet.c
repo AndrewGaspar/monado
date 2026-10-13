@@ -12,6 +12,7 @@
 #include "xreal_air_hmd.h"
 
 #include <cjson/cJSON.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -333,6 +334,75 @@ parse_distortion_json(struct xreal_air_parsed_calibration *calibration, cJSON *d
 	return ok;
 }
 
+static int
+read_json_doubles(cJSON *object, const char *const string, int max, double *out_array)
+{
+	cJSON *obj_array = cJSON_GetObjectItem(object, string);
+
+	if ((!obj_array) || (!cJSON_IsArray(obj_array))) {
+		return 0;
+	}
+
+	int count = cJSON_GetArraySize(obj_array);
+	if (count > max) {
+		count = max;
+	}
+
+	for (int i = 0; i < count; i++) {
+		out_array[i] = cJSON_GetNumberValue(cJSON_GetArrayItem(obj_array, i));
+	}
+
+	return count;
+}
+
+/*!
+ * Parse one camera of the factory `"SLAM_camera"` object (Air 2 Ultra). Values are kept as stored,
+ * the camera model decides how many distortion coefficients there are (12 for "fisheye624").
+ */
+static bool
+parse_slam_camera_json(struct xreal_air_slam_camera_calibration *cam, cJSON *dev)
+{
+	memset(cam, 0, sizeof(*cam));
+
+	if (!dev) {
+		return false;
+	}
+
+	cJSON *model = cJSON_GetObjectItem(dev, "camera_model");
+	if (cJSON_IsString(model)) {
+		snprintf(cam->model, sizeof(cam->model), "%s", cJSON_GetStringValue(model));
+	}
+
+	double res[2] = {0, 0};
+	bool ok = read_json_doubles(dev, "resolution", 2, res) == 2;
+	cam->resolution[0] = (int)res[0];
+	cam->resolution[1] = (int)res[1];
+
+	ok = ok && read_json_doubles(dev, "fc", 2, cam->fc) == 2;
+	ok = ok && read_json_doubles(dev, "cc", 2, cam->cc) == 2;
+	ok = ok && read_json_doubles(dev, "imu_p_cam", 3, cam->imu_p_cam) == 3;
+	ok = ok && read_json_doubles(dev, "imu_q_cam", 4, cam->imu_q_cam) == 4;
+	cam->kc_count = read_json_doubles(dev, "kc", XREAL_AIR_SLAM_CAMERA_MAX_KC, cam->kc);
+
+	cJSON *rst = cJSON_GetObjectItem(dev, "rolling_shutter_time");
+	if (cJSON_IsNumber(rst)) {
+		cam->rolling_shutter_time = cJSON_GetNumberValue(rst);
+	}
+
+	cam->valid = ok && cam->kc_count > 0;
+	return cam->valid;
+}
+
+static void
+parse_slam_cameras_json(struct xreal_air_parsed_calibration *calibration, cJSON *slam)
+{
+	static const char *const key[XREAL_AIR_SLAM_CAMERA_COUNT] = {"device_1", "device_2"};
+
+	for (int i = 0; i < XREAL_AIR_SLAM_CAMERA_COUNT; i++) {
+		parse_slam_camera_json(&calibration->slam_camera[i], slam ? cJSON_GetObjectItem(slam, key[i]) : NULL);
+	}
+}
+
 /*!
  * Extract the IMU calibration (and, when present, the display intrinsics / distortion grids) from a
  * fully-parsed root JSON object. Returns true only if the mandatory IMU calibration was found — the
@@ -353,6 +423,7 @@ extract_calibration_from_root(struct xreal_air_parsed_calibration *calibration, 
 	// distortion meshes. Parse them if present; their absence is not an error (Air 1 has neither).
 	parse_display_json(calibration, cJSON_GetObjectItem(root, "display"));
 	parse_distortion_json(calibration, cJSON_GetObjectItem(root, "display_distortion"));
+	parse_slam_cameras_json(calibration, cJSON_GetObjectItem(root, "SLAM_camera"));
 
 	return true;
 }
@@ -573,6 +644,36 @@ xreal_air_parse_calibration_buffer(struct xreal_air_parsed_calibration *calibrat
 }
 
 #include <stdio.h>
+
+char *
+xreal_air_calibration_document(const char *buffer, size_t size, size_t *out_len)
+{
+	// Un-rotated blob (original Air, or the read cursor happened to sit at 0): the document is
+	// everything up to the zero padding.
+	size_t len = 0;
+	while (len < size && buffer[len] != '\0') {
+		len++;
+	}
+
+	char *out = malloc(len + 1);
+	if (!out) {
+		return NULL;
+	}
+	memcpy(out, buffer, len);
+	out[len] = '\0';
+
+	// The whole run must be one JSON object, a rotated blob can start with a parsable fragment.
+	cJSON *root = out[0] == '{' ? cJSON_ParseWithLengthOpts(out, len + 1, NULL, true) : NULL;
+	const bool whole = root != NULL && cJSON_IsObject(root);
+	cJSON_Delete(root);
+	if (whole) {
+		*out_len = len;
+		return out;
+	}
+	free(out);
+
+	return derotate_calibration_buffer(buffer, size, out_len);
+}
 
 bool
 xreal_air_parse_sensor_packet(struct xreal_air_parsed_sensor *sensor,

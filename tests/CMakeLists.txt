@@ -48,6 +48,9 @@ endif()
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	list(APPEND tests tests_levenbergmarquardt)
 endif()
+if(XRT_BUILD_DRIVER_XREAL_AIR)
+	list(APPEND tests tests_xreal_air_camera_decode)
+endif()
 
 foreach(testname ${tests})
 	add_executable(${testname} ${testname}.cpp)
@@ -120,4 +123,15 @@ endif()
 
 if(XRT_HAVE_VULKAN AND XRT_HAVE_D3D12)
 	target_link_libraries(tests_aux_d3d_d3d12 PRIVATE comp_util aux_vk)
+endif()
+
+if(XRT_BUILD_DRIVER_XREAL_AIR)
+	# The decoder is dependency free, build it straight into the test.
+	target_sources(
+		tests_xreal_air_camera_decode
+		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/xreal_air/xreal_air_camera_decode.c
+		)
+	target_include_directories(
+		tests_xreal_air_camera_decode PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers
+		)
 endif()
