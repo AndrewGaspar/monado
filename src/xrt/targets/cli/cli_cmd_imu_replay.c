@@ -223,6 +223,9 @@ cli_cmd_imu_replay(int argc, const char **argv)
 	float temp_min = 1e9f;
 	float temp_max = -1e9f;
 	double max_gap_ms = 0.0;
+	double max_gap_at_s = 0.0;
+	uint64_t max_gap_index = 0;
+	double first_learn_s = -1.0;
 
 	while (fgets(line, sizeof(line), file) != NULL) {
 		if (line[0] == '#') {
@@ -256,7 +259,11 @@ cli_cmd_imu_replay(int argc, const char **argv)
 			first_dev_ns = s.device_ns;
 		} else {
 			double gap_ms = (double)(s.fusion_ns - last_ns) / 1e6;
-			max_gap_ms = gap_ms > max_gap_ms ? gap_ms : max_gap_ms;
+			if (gap_ms > max_gap_ms) {
+				max_gap_ms = gap_ms;
+				max_gap_at_s = (double)(s.fusion_ns - first_ns) / 1e9;
+				max_gap_index = count;
+			}
 		}
 		last_ns = s.fusion_ns;
 		last_dev_ns = s.device_ns;
@@ -267,6 +274,9 @@ cli_cmd_imu_replay(int argc, const char **argv)
 		m_imu_3dof_update(&fusion_static, (uint64_t)s.fusion_ns, &s.accel, &s.gyro);
 		m_imu_3dof_update(&fusion_est, (uint64_t)s.fusion_ns, &s.accel, &s.gyro);
 		still_count += fusion_est.bias_est.is_still ? 1 : 0;
+		if (first_learn_s < 0.0 && fusion_est.bias_est.commits > 0) {
+			first_learn_s = (double)(s.fusion_ns - first_ns) / 1e9;
+		}
 
 		double t = (double)(s.fusion_ns - first_ns) / 1e9;
 		double yaw[TRACK_COUNT] = {
@@ -332,13 +342,17 @@ cli_cmd_imu_replay(int argc, const char **argv)
 	P("\n");
 	P("samples:     %" PRIu64 " over %.1f s -> %.1f Hz (fusion clock); device clock %.1f s -> %.1f Hz\n", count,
 	  dur_s, (double)(count - 1) / dur_s, dev_dur_s, dev_dur_s > 0 ? (double)(count - 1) / dev_dur_s : 0.0);
-	P("             max gap %.1f ms, %" PRIu64 " malformed lines\n", max_gap_ms, bad_lines);
+	P("             max gap %.1f ms (sample %" PRIu64 ", t=%.3f s), %" PRIu64 " malformed lines\n", max_gap_ms,
+	  max_gap_index, max_gap_at_s, bad_lines);
 	P("temperature: %.2f .. %.2f C\n", (double)temp_min, (double)temp_max);
 	P("estimator:   still %.1f%% of samples, %u blocks learned (%.0f s), final bias "
 	  "[%.4f %.4f %.4f] deg/s\n",
 	  100.0 * (double)still_count / (double)count, fusion_est.bias_est.commits, fusion_est.bias_est.learned_s,
 	  RAD_TO_DEG((double)fusion_est.gyro_bias.value.x), RAD_TO_DEG((double)fusion_est.gyro_bias.value.y),
 	  RAD_TO_DEG((double)fusion_est.gyro_bias.value.z));
+	P("             first learned at %.1f s, sd %.4f deg/s, rejects: %u sample, %u block, %u yaw-window\n",
+	  first_learn_s, (double)fusion_est.bias_est.sd_deg_s, fusion_est.bias_est.rejects_sample,
+	  fusion_est.bias_est.rejects_block, fusion_est.bias_est.rejects_yaw);
 	P("\n");
 	P("yaw            | end-start (deg) | fit, whole (deg/min) | fit, last %.0f s (deg/min)\n", tail_s);
 

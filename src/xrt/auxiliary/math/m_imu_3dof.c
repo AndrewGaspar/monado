@@ -33,39 +33,48 @@
  */
 #define BIAS_EST_MAX_DT_S (0.1)
 
+//! Held blocks needed before their scatter can tell a head from a table.
+#define BIAS_EST_QUIET_MIN_BLOCKS (4)
+
 
 void
 m_imu_3dof_gyro_bias_params_default(struct m_imu_3dof_gyro_bias_params *p)
 {
 	*p = (struct m_imu_3dof_gyro_bias_params){
 	    .enabled = true,
-	    .gate_block_deg_s = 0.25f,
-	    .gate_sample_deg_s = 3.0f,
+	    .gate_sample_deg_s = 10.0f,
 	    .gate_accel_m_s2 = 0.5f,
 	    .gate_accel_jitter_m_s2 = 0.5f,
 	    .accel_window_s = 1.0f,
-	    .still_period_s = 3.0f,
+	    .settle_s = 1.0f,
 	    .block_s = 2.0f,
-	    .held_blocks = 2,
-	    .tau_s = 20.0f,
-	    .fast_tau_s = 5.0f,
-	    .fast_period_s = 10.0f,
+	    .gate_block_deg_s = 2.0f,
+	    .gate_yaw_deg_s = 0.75f,
+	    .gate_yaw_min_deg_s = 0.15f,
+	    .held_blocks = 16,
+	    .quiet_spread_deg_s = 0.03f,
+	    .noise_floor_deg_s = 0.01f,
+	    .init_sd_deg_s = 0.2f,
+	    .walk_deg_s_sqrt_s = 0.002f,
 	    .max_slew_deg_s2 = 0.1f,
-	    .max_dev_deg_s = 0.5f,
+	    .max_dev_deg_s = 1.0f,
 	};
 }
 
 #define BIAS_PARAMS_FLOAT_FIELDS(X)                                                                                    \
-	X(gate_block_deg_s)                                                                                            \
 	X(gate_sample_deg_s)                                                                                           \
 	X(gate_accel_m_s2)                                                                                             \
 	X(gate_accel_jitter_m_s2)                                                                                      \
 	X(accel_window_s)                                                                                              \
-	X(still_period_s)                                                                                              \
+	X(settle_s)                                                                                                    \
 	X(block_s)                                                                                                     \
-	X(tau_s)                                                                                                       \
-	X(fast_tau_s)                                                                                                  \
-	X(fast_period_s)                                                                                               \
+	X(gate_block_deg_s)                                                                                            \
+	X(gate_yaw_deg_s)                                                                                              \
+	X(gate_yaw_min_deg_s)                                                                                          \
+	X(quiet_spread_deg_s)                                                                                          \
+	X(noise_floor_deg_s)                                                                                           \
+	X(init_sd_deg_s)                                                                                               \
+	X(walk_deg_s_sqrt_s)                                                                                           \
 	X(max_slew_deg_s2)                                                                                             \
 	X(max_dev_deg_s)
 
@@ -131,16 +140,16 @@ m_imu_3dof_gyro_bias_params_print(const struct m_imu_3dof_gyro_bias_params *p, c
 #undef PRINT_FLOAT
 }
 
+//! Throw away everything not yet learned and wait @ref settle_s before collecting again.
 static void
 bias_est_restart(struct m_imu_3dof *f, uint64_t timestamp_ns)
 {
-	f->bias_est.still_start_ns = timestamp_ns;
+	f->bias_est.settle_until_ns = timestamp_ns + (uint64_t)((double)f->bias_est.params.settle_s * DUR_1S_IN_NS);
 	f->bias_est.block_sum = (struct xrt_vec3)XRT_VEC3_ZERO;
 	f->bias_est.block_dt = 0.0;
 	f->bias_est.block_start_ns = timestamp_ns;
 	f->bias_est.held_count = 0;
 	f->bias_est.is_still = false;
-	f->bias_est.still_s = 0.0f;
 }
 
 void
@@ -229,42 +238,33 @@ m_imu_3dof_add_vars(struct m_imu_3dof *f, void *root, const char *prefix)
 #define ADD_F32(NAME)                                                                                                  \
 	snprintf(tmp, sizeof(tmp), "%sbias_est." #NAME, prefix);                                                       \
 	u_var_add_f32(root, &p->NAME, tmp);
+#define ADD_RO(KIND, NAME)                                                                                             \
+	snprintf(tmp, sizeof(tmp), "%sbias_est." #NAME, prefix);                                                       \
+	u_var_add_##KIND(root, &f->bias_est.NAME, tmp);
 
 	snprintf(tmp, sizeof(tmp), "%sbias_est.enabled", prefix);
 	u_var_add_bool(root, &p->enabled, tmp);
-	ADD_F32(gate_block_deg_s);
-	ADD_F32(gate_sample_deg_s);
-	ADD_F32(gate_accel_m_s2);
-	ADD_F32(gate_accel_jitter_m_s2);
-	ADD_F32(accel_window_s);
-	ADD_F32(still_period_s);
-	ADD_F32(block_s);
+	BIAS_PARAMS_FLOAT_FIELDS(ADD_F32)
 	snprintf(tmp, sizeof(tmp), "%sbias_est.held_blocks", prefix);
 	u_var_add_i32(root, &p->held_blocks, tmp);
-	ADD_F32(tau_s);
-	ADD_F32(fast_tau_s);
-	ADD_F32(fast_period_s);
-	ADD_F32(max_slew_deg_s2);
-	ADD_F32(max_dev_deg_s);
 
+	ADD_RO(ro_vec3_f32, origin)
+	ADD_RO(ro_vec3_f32, last_block_rate)
+	ADD_RO(ro_vec3_f32, accel_mean)
+	ADD_RO(bool, is_still)
+	ADD_RO(bool, is_quiet)
+	ADD_RO(ro_f32, spread_deg_s)
+	ADD_RO(ro_f32, window_yaw_deg_s)
+	ADD_RO(ro_f32, sd_deg_s)
+	ADD_RO(ro_i32, held_count)
+	ADD_RO(ro_f64, learned_s)
+	ADD_RO(ro_u32, commits)
+	ADD_RO(ro_u32, rejects_sample)
+	ADD_RO(ro_u32, rejects_block)
+	ADD_RO(ro_u32, rejects_yaw)
+
+#undef ADD_RO
 #undef ADD_F32
-
-	snprintf(tmp, sizeof(tmp), "%sbias_est.origin", prefix);
-	u_var_add_ro_vec3_f32(root, &f->bias_est.origin, tmp);
-	snprintf(tmp, sizeof(tmp), "%sbias_est.last_block_rate", prefix);
-	u_var_add_ro_vec3_f32(root, &f->bias_est.last_block_rate, tmp);
-	snprintf(tmp, sizeof(tmp), "%sbias_est.accel_mean", prefix);
-	u_var_add_ro_vec3_f32(root, &f->bias_est.accel_mean, tmp);
-	snprintf(tmp, sizeof(tmp), "%sbias_est.is_still", prefix);
-	u_var_add_bool(root, &f->bias_est.is_still, tmp);
-	snprintf(tmp, sizeof(tmp), "%sbias_est.still_s", prefix);
-	u_var_add_ro_f32(root, &f->bias_est.still_s, tmp);
-	snprintf(tmp, sizeof(tmp), "%sbias_est.learned_s", prefix);
-	u_var_add_ro_f64(root, &f->bias_est.learned_s, tmp);
-	snprintf(tmp, sizeof(tmp), "%sbias_est.commits", prefix);
-	u_var_add_ro_u32(root, &f->bias_est.commits, tmp);
-	snprintf(tmp, sizeof(tmp), "%sbias_est.held_count", prefix);
-	u_var_add_ro_i32(root, &f->bias_est.held_count, tmp);
 }
 
 static void
@@ -393,21 +393,39 @@ gyro_biasing(struct m_imu_3dof *f, uint64_t timestamp_ns)
 	f->gyro_bias.value = gyro_mean;
 }
 
+static float
+deg_to_rad_f(float deg)
+{
+	return (float)DEG_TO_RAD(deg);
+}
+
+//! One Kalman update of the bias with a block's absolute mean rate @p z.
 static void
-bias_est_learn(struct m_imu_3dof *f, struct xrt_vec3 rate, double dt)
+bias_est_learn(struct m_imu_3dof *f, uint64_t timestamp_ns, struct xrt_vec3 z, double dt, double meas_var)
 {
 	const struct m_imu_3dof_gyro_bias_params *p = &f->bias_est.params;
+	const double max_var = DEG_TO_RAD((double)p->max_dev_deg_s) * DEG_TO_RAD((double)p->max_dev_deg_s);
 
-	// Residual against the current estimate; the held rate is absolute.
-	struct xrt_vec3 residual = m_vec3_sub(rate, f->gyro_bias.value);
+	if (!f->bias_est.var_valid) {
+		double sd = DEG_TO_RAD((double)p->init_sd_deg_s);
+		f->bias_est.var = sd * sd;
+		f->bias_est.var_valid = true;
+		f->bias_est.last_learn_ns = timestamp_ns;
+	}
 
-	float tau = f->bias_est.learned_s < (double)p->fast_period_s ? p->fast_tau_s : p->tau_s;
-	tau = fmaxf(tau, 0.001f);
-	float k = (float)(1.0 - exp(-dt / (double)tau));
-	struct xrt_vec3 step = m_vec3_mul_scalar(residual, k);
+	// The bias keeps walking while we cannot see it (motion), so grow the variance by wall time.
+	double walk = DEG_TO_RAD((double)p->walk_deg_s_sqrt_s);
+	double since_s = (double)(timestamp_ns - f->bias_est.last_learn_ns) / DUR_1S_IN_NS;
+	f->bias_est.var = fmin(f->bias_est.var + walk * walk * since_s, max_var);
+	f->bias_est.last_learn_ns = timestamp_ns;
+
+	double k = f->bias_est.var / (f->bias_est.var + meas_var);
+	struct xrt_vec3 step = m_vec3_mul_scalar(m_vec3_sub(z, f->gyro_bias.value), (float)k);
+	f->bias_est.var *= 1.0 - k;
+	f->bias_est.sd_deg_s = (float)RAD_TO_DEG(sqrt(f->bias_est.var));
 
 	// Never snap: limit how fast the estimate may move.
-	float max_step = (float)DEG_TO_RAD(p->max_slew_deg_s2) * (float)dt;
+	float max_step = deg_to_rad_f(p->max_slew_deg_s2) * (float)dt;
 	float step_len = m_vec3_len(step);
 	if (step_len > max_step) {
 		step = m_vec3_mul_scalar(step, max_step / step_len);
@@ -415,7 +433,7 @@ bias_est_learn(struct m_imu_3dof *f, struct xrt_vec3 rate, double dt)
 
 	// Never stray far from where we started (factory calibration).
 	struct xrt_vec3 dev = m_vec3_sub(m_vec3_add(f->gyro_bias.value, step), f->bias_est.origin);
-	float max_dev = (float)DEG_TO_RAD(p->max_dev_deg_s);
+	float max_dev = deg_to_rad_f(p->max_dev_deg_s);
 	float dev_len = m_vec3_len(dev);
 	if (dev_len > max_dev) {
 		dev = m_vec3_mul_scalar(dev, max_dev / dev_len);
@@ -427,6 +445,70 @@ bias_est_learn(struct m_imu_3dof *f, struct xrt_vec3 rate, double dt)
 }
 
 static void
+bias_est_drop_newest_held(struct m_imu_3dof *f)
+{
+	if (f->bias_est.held_count > 0) {
+		f->bias_est.held_count--;
+	}
+}
+
+/*!
+ * Window check over the held blocks, newest first. Returns false when the
+ * gravity-aligned residual of any recent window is too large to be a bias: a
+ * directed (slow) yaw rotation. Also fills in the scatter of the held blocks.
+ */
+static bool
+bias_est_window_ok(struct m_imu_3dof *f, double *out_meas_var)
+{
+	const struct m_imu_3dof_gyro_bias_params *p = &f->bias_est.params;
+	const int32_t n = f->bias_est.held_count;
+
+	// Scatter of the held block means around their mean, per axis.
+	struct xrt_vec3 mean = XRT_VEC3_ZERO;
+	for (int32_t i = 0; i < n; i++) {
+		mean = m_vec3_add(mean, f->bias_est.held[i].rate);
+	}
+	mean = m_vec3_mul_scalar(mean, 1.0f / (float)n);
+
+	double sq = 0.0;
+	for (int32_t i = 0; i < n; i++) {
+		sq += m_vec3_len_sqrd(m_vec3_sub(f->bias_est.held[i].rate, mean));
+	}
+	double var = n > 1 ? sq / (3.0 * (double)(n - 1)) : 0.0;
+	double floor_rad = DEG_TO_RAD((double)p->noise_floor_deg_s);
+	*out_meas_var = fmax(var, floor_rad * floor_rad);
+
+	float spread = (float)RAD_TO_DEG(sqrt(var));
+	f->bias_est.spread_deg_s = spread;
+
+	// Too few blocks to judge the scatter yet: only hold them to the quiet limit for now, the full
+	// check runs again with every new block and nothing is learned before then.
+	const bool judged = n >= BIAS_EST_QUIET_MIN_BLOCKS;
+	const bool quiet = judged && spread < p->quiet_spread_deg_s;
+	f->bias_est.is_quiet = quiet;
+
+	double yaw_sum = 0.0;
+	for (int32_t len = 1; len <= n; len++) {
+		const int32_t i = n - len;
+		struct xrt_vec3 residual = m_vec3_sub(f->bias_est.held[i].rate, f->gyro_bias.value);
+		yaw_sum += m_vec3_dot(residual, f->bias_est.held[i].up);
+
+		double yaw = fabs(RAD_TO_DEG(yaw_sum / (double)len));
+		double limit = (quiet || !judged)
+		                   ? (double)p->max_dev_deg_s
+		                   : fmax((double)p->gate_yaw_deg_s / sqrt((double)len), (double)p->gate_yaw_min_deg_s);
+		if (len == n) {
+			f->bias_est.window_yaw_deg_s = (float)yaw;
+		}
+		if (yaw >= limit) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static void
 bias_est_finish_block(struct m_imu_3dof *f, uint64_t timestamp_ns)
 {
 	const struct m_imu_3dof_gyro_bias_params *p = &f->bias_est.params;
@@ -434,54 +516,71 @@ bias_est_finish_block(struct m_imu_3dof *f, uint64_t timestamp_ns)
 	struct xrt_vec3 corrected = m_vec3_mul_scalar(f->bias_est.block_sum, (float)(1.0 / f->bias_est.block_dt));
 	f->bias_est.last_block_rate = corrected;
 
-	/*
-	 * A directed rotation shows up as a block mean at its full rate, while
-	 * oscillating head sway mostly cancels within a block. A failing block also
-	 * throws away the held ones: they may hold the slow start of this motion.
-	 */
-	if (m_vec3_len(corrected) >= (float)DEG_TO_RAD(p->gate_block_deg_s)) {
-		bias_est_restart(f, timestamp_ns);
+	const bool settled = f->bias_est.block_start_ns >= f->bias_est.settle_until_ns;
+	const double block_dt = f->bias_est.block_dt;
+
+	f->bias_est.block_sum = (struct xrt_vec3)XRT_VEC3_ZERO;
+	f->bias_est.block_dt = 0.0;
+	f->bias_est.block_start_ns = timestamp_ns;
+
+	if (!settled) {
 		return;
 	}
 
-	// Every sample in the block was corrected by the current value, store it absolute.
-	struct xrt_vec3 rate = m_vec3_add(corrected, f->gyro_bias.value);
+	// Way off even for a stale bias: motion. The block before may hold its start.
+	if (m_vec3_len(corrected) >= deg_to_rad_f(p->gate_block_deg_s)) {
+		f->bias_est.rejects_block++;
+		bias_est_drop_newest_held(f);
+		return;
+	}
 
 	int32_t depth = p->held_blocks;
 	depth = depth < 1 ? 1 : depth;
 	depth = depth > M_IMU_3DOF_BIAS_EST_MAX_HELD ? M_IMU_3DOF_BIAS_EST_MAX_HELD : depth;
 
-	// Enough newer blocks passed: learn from the oldest one.
+	// Make room, a lowered depth (live tuning) just loses the oldest.
 	while (f->bias_est.held_count >= depth) {
-		uint64_t still_period_ns = (uint64_t)((double)p->still_period_s * DUR_1S_IN_NS);
-		if (f->bias_est.held[0].start_ns >= f->bias_est.still_start_ns + still_period_ns) {
-			bias_est_learn(f, f->bias_est.held[0].rate, f->bias_est.held[0].dt);
-		}
-
 		f->bias_est.held_count--;
 		for (int32_t i = 0; i < f->bias_est.held_count; i++) {
 			f->bias_est.held[i] = f->bias_est.held[i + 1];
 		}
 	}
 
+	// Every sample in the block was corrected by the current value, store it absolute.
 	int32_t i = f->bias_est.held_count++;
-	f->bias_est.held[i].rate = rate;
-	f->bias_est.held[i].dt = f->bias_est.block_dt;
-	f->bias_est.held[i].start_ns = f->bias_est.block_start_ns;
+	f->bias_est.held[i].rate = m_vec3_add(corrected, f->gyro_bias.value);
+	f->bias_est.held[i].up = m_vec3_normalize(f->bias_est.accel_mean);
+	f->bias_est.held[i].dt = block_dt;
 
-	f->bias_est.block_sum = (struct xrt_vec3)XRT_VEC3_ZERO;
-	f->bias_est.block_dt = 0.0;
-	f->bias_est.block_start_ns = timestamp_ns;
+	double meas_var = 0.0;
+	if (!bias_est_window_ok(f, &meas_var)) {
+		// Directed yaw rotation somewhere in the window, none of it is bias.
+		f->bias_est.rejects_yaw++;
+		f->bias_est.held_count = 0;
+		return;
+	}
+
+	if (f->bias_est.held_count < depth) {
+		return;
+	}
+
+	// The oldest block has passed every window it was part of, learn it.
+	bias_est_learn(f, timestamp_ns, f->bias_est.held[0].rate, f->bias_est.held[0].dt, meas_var);
+
+	f->bias_est.held_count--;
+	for (int32_t k = 0; k < f->bias_est.held_count; k++) {
+		f->bias_est.held[k] = f->bias_est.held[k + 1];
+	}
 }
 
 /*!
  * Stillness-gated gyro bias tracking, see @ref M_IMU_3DOF_AUTO_GYRO_BIAS.
  *
- * The gates look at the bias-corrected rate, so at rest they see the residual
- * bias plus noise. Per sample: no rate spike, no acceleration jitter and ~1g.
- * Per block: a low mean rate. Learning is deferred by @ref
- * m_imu_3dof_gyro_bias_params::held_blocks blocks so the slow start of a motion
- * (before any gate trips) is thrown away instead of learned.
+ * Per sample: no rate spike, no acceleration jitter and ~1g, else the current
+ * block and the newest held one are dropped and collection pauses for @ref
+ * m_imu_3dof_gyro_bias_params::settle_s. Per block: a sane mean rate. Per
+ * window of held blocks: a small, consistent yaw residual. Only then is the
+ * oldest held block learned.
  */
 static void
 bias_est_update(struct m_imu_3dof *f,
@@ -512,17 +611,30 @@ bias_est_update(struct m_imu_3dof *f,
 	float accel_mean_err = fabsf(m_vec3_len(f->bias_est.accel_mean) - (float)MATH_GRAVITY_M_S2);
 	float accel_jitter = m_vec3_len(m_vec3_sub(*accel, f->bias_est.accel_mean));
 
-	bool still = gyro_len < (float)DEG_TO_RAD(p->gate_sample_deg_s) && //
-	             accel_mean_err < p->gate_accel_m_s2 &&                //
+	bool still = gyro_len < deg_to_rad_f(p->gate_sample_deg_s) && //
+	             accel_mean_err < p->gate_accel_m_s2 &&           //
 	             accel_jitter < p->gate_accel_jitter_m_s2;
 
 	if (!still) {
-		bias_est_restart(f, timestamp_ns);
+		// First failing sample of an episode: the newest held block may hold its start.
+		if (timestamp_ns >= f->bias_est.settle_until_ns) {
+			f->bias_est.rejects_sample++;
+			bias_est_drop_newest_held(f);
+		}
+		f->bias_est.settle_until_ns = timestamp_ns + (uint64_t)((double)p->settle_s * DUR_1S_IN_NS);
+		f->bias_est.is_still = false;
+	}
+
+	// Settling (or just failed): keep the block empty so it starts once settled.
+	if (timestamp_ns < f->bias_est.settle_until_ns) {
+		f->bias_est.block_sum = (struct xrt_vec3)XRT_VEC3_ZERO;
+		f->bias_est.block_dt = 0.0;
+		f->bias_est.block_start_ns = timestamp_ns;
+		f->bias_est.is_still = false;
 		return;
 	}
 
 	f->bias_est.is_still = true;
-	f->bias_est.still_s = (float)((double)(timestamp_ns - f->bias_est.still_start_ns) / DUR_1S_IN_NS);
 
 	f->bias_est.block_sum = m_vec3_add(f->bias_est.block_sum, m_vec3_mul_scalar(*gyro_biased, (float)dt));
 	f->bias_est.block_dt += dt;

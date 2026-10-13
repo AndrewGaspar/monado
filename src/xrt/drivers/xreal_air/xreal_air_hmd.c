@@ -752,6 +752,13 @@ handle_sensor_msg(struct xreal_air_hmd *hmd, unsigned char *buffer, size_t size)
 
 	time_duration_ns inter_sample_duration_ns = delta;
 
+	// The very first sample has no previous one: delta is then the raw device clock (mod 2^32 ns,
+	// up to ~4.3 s), which used to back-date the fusion's first timestamp by that much and hand the
+	// second sample a multi-second dt.
+	if (hmd->fusion.state == M_IMU_3DOF_STATE_START) {
+		inter_sample_duration_ns = 0;
+	}
+
 	// If this is larger then one second something bad is going on.
 	if (hmd->fusion.state != M_IMU_3DOF_STATE_START &&
 	    inter_sample_duration_ns >= (time_duration_ns)U_TIME_1S_IN_NS) {
