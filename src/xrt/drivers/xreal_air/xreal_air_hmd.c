@@ -23,6 +23,7 @@
 #include "util/u_var.h"
 
 #include "xreal_air_hmd.h"
+#include "xreal_air_imu_dump.h"
 
 #include "math/m_mathinclude.h"
 #include "math/m_relation_history.h"
@@ -63,9 +64,12 @@ DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_scanout_comp, "XREAL_AIR_SCANOUT_COMP", tru
  *    (M_IMU_3DOF_AUTO_GYRO_BIAS), fusion is then bit-identical to before.
  *  - XREAL_AIR_GYRO_BIAS_PARAMS=k=v,..  -> override the estimator tunables, keys are the fields
  *    of struct m_imu_3dof_gyro_bias_params (also live-tunable via XRT_DEBUG_GUI=1).
+ *  - XREAL_AIR_IMU_DUMP=/path.csv|/dir  -> write every fused IMU sample to a CSV (a directory gets
+ *    a timestamped file) for offline replay with `monado-cli imu-replay`.
  */
 DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_auto_gyro_bias, "XREAL_AIR_AUTO_GYRO_BIAS", true)
 DEBUG_GET_ONCE_OPTION(xreal_air_gyro_bias_params, "XREAL_AIR_GYRO_BIAS_PARAMS", NULL)
+DEBUG_GET_ONCE_OPTION(xreal_air_imu_dump, "XREAL_AIR_IMU_DUMP", NULL)
 
 /*!
  * Private struct for the xreal_air device.
@@ -150,6 +154,9 @@ struct xreal_air_hmd
 
 	//! Arm the fusion's gyro bias estimator once the factory calibration is in.
 	bool gyro_bias_arm_on_calibration;
+
+	//! Optional raw IMU dump, only touched from the sensor thread (and create/destroy).
+	struct xreal_air_imu_dump *imu_dump;
 };
 
 /*
@@ -353,7 +360,11 @@ update_fusion_locked(struct xreal_air_hmd *hmd, struct xreal_air_parsed_sample *
 }
 
 static void
-update_fusion(struct xreal_air_hmd *hmd, struct xreal_air_parsed_sample *sample, uint64_t timestamp_ns)
+update_fusion(struct xreal_air_hmd *hmd,
+              struct xreal_air_parsed_sample *sample,
+              uint64_t timestamp_ns,
+              uint64_t device_ns,
+              timepoint_ns host_ns)
 {
 	struct xrt_space_relation rel;
 	U_ZERO(&rel); // Clear out the relation.
@@ -364,7 +375,28 @@ update_fusion(struct xreal_air_hmd *hmd, struct xreal_air_parsed_sample *sample,
 	update_fusion_locked(hmd, sample, timestamp_ns);
 	rel.pose.orientation = hmd->fusion.rot; // We have no tracking, don't return a position.
 	struct xrt_vec3 gyro = hmd->read.gyro;  // Calibrated body-space angular rate (rad/s).
+
+	struct xreal_air_imu_dump_record dump_rec;
+	if (hmd->imu_dump != NULL) {
+		dump_rec = (struct xreal_air_imu_dump_record){
+		    .device_ns = device_ns,
+		    .fusion_ns = (int64_t)timestamp_ns,
+		    .host_ns = host_ns,
+		    .temperature_c = hmd->read.temperature,
+		    .gyro = hmd->read.gyro,
+		    .accel = hmd->read.accel,
+		    .mag = hmd->read.mag,
+		    .bias = hmd->fusion.gyro_bias.value,
+		    .rot = hmd->fusion.rot,
+		    .still = hmd->fusion.bias_est.is_still,
+		};
+	}
 	os_mutex_unlock(&hmd->device_mutex);
+
+	// Outside the lock, never blocks.
+	if (hmd->imu_dump != NULL) {
+		xreal_air_imu_dump_push(hmd->imu_dump, &dump_rec);
+	}
 
 	/*
 	 * Publish the angular velocity so consumers can predict the pose forward in time.
@@ -719,7 +751,7 @@ handle_sensor_msg(struct xreal_air_hmd *hmd, unsigned char *buffer, size_t size)
 	timestamp_ns = ensure_forward_progress_timestamps(hmd, timestamp_ns);
 
 	// Update the fusion with the sample.
-	update_fusion(hmd, &s->sample, timestamp_ns);
+	update_fusion(hmd, &s->sample, timestamp_ns, s->timestamp, now_ns);
 }
 
 static void
@@ -1238,6 +1270,9 @@ teardown(struct xreal_air_hmd *hmd)
 	// Shutdown the sensor thread early.
 	os_thread_helper_stop_and_wait(&hmd->oth);
 
+	// Nothing pushes any more, flush the rest.
+	xreal_air_imu_dump_destroy(&hmd->imu_dump);
+
 	if (hmd->hid_control != NULL) {
 		os_hid_destroy(hmd->hid_control);
 		hmd->hid_control = NULL;
@@ -1505,6 +1540,16 @@ xreal_air_hmd_create_device(struct os_hid_device *sensor_device,
 		hmd->fusion.bias_est.params.enabled = false;
 	}
 	XREAL_AIR_DEBUG(hmd, "Auto gyro bias: %s", bias_params);
+
+	const char *dump_path = debug_get_option_xreal_air_imu_dump();
+	if (dump_path != NULL && dump_path[0] != '\0') {
+		char header[640];
+		snprintf(header, sizeof(header), "auto_gyro_bias=%s", bias_params);
+		hmd->imu_dump = xreal_air_imu_dump_create(dump_path, header);
+		if (hmd->imu_dump != NULL) {
+			U_LOG_W("Xreal Air: dumping raw IMU samples to '%s'", xreal_air_imu_dump_path(hmd->imu_dump));
+		}
+	}
 
 	hmd->static_id = 0;
 	hmd->display_on = false;
