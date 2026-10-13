@@ -19,6 +19,8 @@
 #include "math/m_mathinclude.h"
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <assert.h>
 
 #define DUR_1S_IN_NS (1000 * 1000 * 1000)
@@ -51,6 +53,82 @@ m_imu_3dof_gyro_bias_params_default(struct m_imu_3dof_gyro_bias_params *p)
 	    .max_slew_deg_s2 = 0.1f,
 	    .max_dev_deg_s = 0.5f,
 	};
+}
+
+#define BIAS_PARAMS_FLOAT_FIELDS(X)                                                                                    \
+	X(gate_block_deg_s)                                                                                            \
+	X(gate_sample_deg_s)                                                                                           \
+	X(gate_accel_m_s2)                                                                                             \
+	X(gate_accel_jitter_m_s2)                                                                                      \
+	X(accel_window_s)                                                                                              \
+	X(still_period_s)                                                                                              \
+	X(block_s)                                                                                                     \
+	X(tau_s)                                                                                                       \
+	X(fast_tau_s)                                                                                                  \
+	X(fast_period_s)                                                                                               \
+	X(max_slew_deg_s2)                                                                                             \
+	X(max_dev_deg_s)
+
+bool
+m_imu_3dof_gyro_bias_params_parse(struct m_imu_3dof_gyro_bias_params *p, const char *str)
+{
+	const char *c = str;
+
+	while (*c != '\0') {
+		// Skip separators.
+		if (*c == ',' || *c == ' ' || *c == '\t') {
+			c++;
+			continue;
+		}
+
+		const char *eq = strchr(c, '=');
+		if (eq == NULL) {
+			return false;
+		}
+		size_t key_len = (size_t)(eq - c);
+		char *end = NULL;
+		double value = strtod(eq + 1, &end);
+		if (end == eq + 1) {
+			return false;
+		}
+
+#define KEY_IS(NAME) (key_len == strlen(NAME) && strncmp(c, NAME, key_len) == 0)
+#define TRY_FLOAT(NAME)                                                                                                \
+	if (KEY_IS(#NAME)) {                                                                                           \
+		p->NAME = (float)value;                                                                                \
+	} else
+
+		BIAS_PARAMS_FLOAT_FIELDS(TRY_FLOAT)
+		if (KEY_IS("enabled")) {
+			p->enabled = value != 0.0;
+		} else if (KEY_IS("held_blocks")) {
+			p->held_blocks = (int32_t)value;
+		} else {
+			return false;
+		}
+
+#undef TRY_FLOAT
+#undef KEY_IS
+
+		c = end;
+	}
+
+	return true;
+}
+
+void
+m_imu_3dof_gyro_bias_params_print(const struct m_imu_3dof_gyro_bias_params *p, char *buf, size_t size)
+{
+	int n = snprintf(buf, size, "enabled=%d,held_blocks=%d", p->enabled ? 1 : 0, (int)p->held_blocks);
+
+#define PRINT_FLOAT(NAME)                                                                                              \
+	if (n >= 0 && (size_t)n < size) {                                                                              \
+		n += snprintf(buf + n, size - (size_t)n, "," #NAME "=%g", (double)p->NAME);                            \
+	}
+
+	BIAS_PARAMS_FLOAT_FIELDS(PRINT_FLOAT)
+
+#undef PRINT_FLOAT
 }
 
 static void

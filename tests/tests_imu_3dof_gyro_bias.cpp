@@ -330,3 +330,29 @@ TEST_CASE("imu_3dof_gyro_bias: deviation clamp and reset")
 	CHECK(sim.fusion.bias_est.commits == 0);
 	CHECK(sim.fusion.gyro_bias.value.y == 0.0f);
 }
+
+TEST_CASE("imu_3dof_gyro_bias: params parse and print round-trip")
+{
+	struct m_imu_3dof_gyro_bias_params p;
+	m_imu_3dof_gyro_bias_params_default(&p);
+
+	CHECK(m_imu_3dof_gyro_bias_params_parse(&p, "tau_s=30, gate_block_deg_s=0.2 held_blocks=4,enabled=0"));
+	CHECK(p.tau_s == 30.0f);
+	CHECK(p.gate_block_deg_s == 0.2f);
+	CHECK(p.held_blocks == 4);
+	CHECK_FALSE(p.enabled);
+
+	CHECK_FALSE(m_imu_3dof_gyro_bias_params_parse(&p, "nope=1"));
+	CHECK_FALSE(m_imu_3dof_gyro_bias_params_parse(&p, "tau_s"));
+	CHECK_FALSE(m_imu_3dof_gyro_bias_params_parse(&p, "tau_s=abc"));
+
+	char buf[512];
+	m_imu_3dof_gyro_bias_params_print(&p, buf, sizeof(buf));
+	struct m_imu_3dof_gyro_bias_params q;
+	m_imu_3dof_gyro_bias_params_default(&q);
+	REQUIRE(m_imu_3dof_gyro_bias_params_parse(&q, buf));
+	CHECK(q.tau_s == p.tau_s);
+	CHECK(q.held_blocks == p.held_blocks);
+	CHECK(q.enabled == p.enabled);
+	CHECK(q.max_dev_deg_s == p.max_dev_deg_s);
+}

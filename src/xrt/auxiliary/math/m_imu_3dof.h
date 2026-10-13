@@ -171,6 +171,22 @@ struct m_imu_3dof
 void
 m_imu_3dof_gyro_bias_params_default(struct m_imu_3dof_gyro_bias_params *p);
 
+/*!
+ * Override tunables from a string like "tau_s=30,gate_block_deg_s=0.2", keys are
+ * the field names of @ref m_imu_3dof_gyro_bias_params, separated by commas or
+ * whitespace. Meant for env vars and offline tools.
+ *
+ * @return false on an unknown key or malformed value, earlier keys stay applied.
+ */
+bool
+m_imu_3dof_gyro_bias_params_parse(struct m_imu_3dof_gyro_bias_params *p, const char *str);
+
+/*!
+ * Print all tunables as a string @ref m_imu_3dof_gyro_bias_params_parse accepts.
+ */
+void
+m_imu_3dof_gyro_bias_params_print(const struct m_imu_3dof_gyro_bias_params *p, char *buf, size_t size);
+
 void
 m_imu_3dof_init(struct m_imu_3dof *f, int flags);
 
