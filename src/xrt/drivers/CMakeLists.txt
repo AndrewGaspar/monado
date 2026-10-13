@@ -130,8 +130,15 @@ if(XRT_BUILD_DRIVER_XREAL_AIR)
 	target_include_directories(drv_xreal_air PRIVATE ${HIDAPI_INCLUDE_DIRS})
 	# Opt-in SLAM camera capture + dataset recording (XREAL_AIR_CAMERAS / XREAL_AIR_EUROC_RECORD).
 	target_sources(
-		drv_xreal_air PRIVATE xreal_air/xreal_air_camera_decode.h xreal_air/xreal_air_camera_decode.c
+		drv_xreal_air
+		PRIVATE xreal_air/xreal_air_camera_decode.h
+			xreal_air/xreal_air_camera_decode.c
+			xreal_air/xreal_air_camera.h
+			xreal_air/xreal_air_camera.c
+			xreal_air/xreal_air_record.h
+			xreal_air/xreal_air_record.c
 		)
+	target_link_libraries(drv_xreal_air PRIVATE aux_math aux_os xrt-external-stb)
 	list(APPEND ENABLED_HEADSET_DRIVERS xreal_air)
 endif()
 
