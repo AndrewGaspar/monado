@@ -13,7 +13,10 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <random>
+#include <vector>
 
 
 static constexpr double kRateHz = 1000.0;
@@ -47,6 +50,25 @@ struct Sim
 
 	xrt_vec3 bias = {}; //!< Sensor bias (rad/s), what the estimator has to find.
 
+	/*!
+	 * Worn-head model, fit to a real worn "hold still" capture (Air 2 Ultra):
+	 * per-axis 2 s block means scatter by ~0.25 deg/s and average down faster
+	 * than white noise (the head returns), the net head angle stays within a
+	 * few degrees, and every few seconds a quick small flick there and back
+	 * pushes single samples to 5-10 deg/s.
+	 */
+	bool worn = false;
+	struct Wave
+	{
+		int axis;
+		double amp_rad, w, phase;
+	};
+	std::vector<Wave> waves;
+	double next_flick_s = 3.0;
+	double flick_start_s = -10.0;
+	int flick_axis = 0;
+	double flick_sign = 1.0;
+
 	Sim(bool auto_bias, float gyro_noise_deg_s = 0.05f, float accel_noise_m_s2 = 0.02f)
 	    : gyro_noise(0.0f, (float)rad(gyro_noise_deg_s)), accel_noise(0.0f, accel_noise_m_s2)
 	{
@@ -55,6 +77,47 @@ struct Sim
 			flags |= M_IMU_3DOF_AUTO_GYRO_BIAS;
 		}
 		m_imu_3dof_init(&fusion, flags);
+	}
+
+	void
+	wear()
+	{
+		worn = true;
+		std::uniform_real_distribution<double> freq(0.15, 1.2);
+		std::uniform_real_distribution<double> phase(0.0, 2.0 * M_PI);
+		for (int axis = 0; axis < 3; axis++) {
+			for (int k = 0; k < 4; k++) {
+				waves.push_back({axis, rad(0.2), 2.0 * M_PI * freq(rng), phase(rng)});
+			}
+		}
+	}
+
+	//! Head-motion angular rate at the current time (rad/s), zero net angle.
+	xrt_vec3
+	head_rate()
+	{
+		xrt_vec3 r = {};
+		if (!worn) {
+			return r;
+		}
+		double t = (double)now_ns / 1e9;
+		float *c = &r.x;
+		for (auto &w : waves) {
+			c[w.axis] += (float)(w.amp_rad * w.w * std::cos(w.w * t + w.phase));
+		}
+		if (t >= next_flick_s) {
+			flick_start_s = t;
+			flick_axis = (int)(rng() % 3);
+			flick_sign = (rng() & 1) ? 1.0 : -1.0;
+			next_flick_s = t + 2.0 + (double)(rng() % 6000) / 1000.0;
+		}
+		// 1 deg out and back over 0.4 s: one sine period of rate, peak ~7.9 deg/s.
+		double ft = t - flick_start_s;
+		if (ft < 0.4) {
+			c[flick_axis] +=
+			    (float)(flick_sign * rad(1.0) * (M_PI / 0.4) * std::sin(2.0 * M_PI * ft / 0.4));
+		}
+		return r;
 	}
 
 	~Sim()
@@ -69,10 +132,12 @@ struct Sim
 		now_ns += kStepNs;
 		true_yaw += yaw_rate / kRateHz;
 
+		xrt_vec3 head = head_rate();
+		true_yaw += head.y / kRateHz;
 		xrt_vec3 gyro = {
-		    bias.x + gyro_noise(rng),
-		    (float)yaw_rate + bias.y + gyro_noise(rng),
-		    bias.z + gyro_noise(rng),
+		    head.x + bias.x + gyro_noise(rng),
+		    head.y + (float)yaw_rate + bias.y + gyro_noise(rng),
+		    head.z + bias.z + gyro_noise(rng),
 		};
 		xrt_vec3 accel = {
 		    extra_accel.x + accel_noise(rng),
@@ -117,6 +182,23 @@ struct Sim
 		return deg(e);
 	}
 
+	//! Least-squares yaw drift rate of the fused-minus-true error over @p seconds (deg/min).
+	double
+	drift_deg_min(double seconds, double rate_deg_s = 0.0)
+	{
+		double n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+		for (int i = 0; i < (int)(seconds * kRateHz); i++) {
+			step(rad(rate_deg_s));
+			if (i % 100 != 0) {
+				continue;
+			}
+			double x = i / kRateHz;
+			double y = yaw_error_deg();
+			n++, sx += x, sy += y, sxx += x * x, sxy += x * y;
+		}
+		return 60.0 * (n * sxy - sx * sy) / (n * sxx - sx * sx);
+	}
+
 	//! Remaining bias error on the yaw axis (deg/s).
 	double
 	yaw_bias_error_deg_s() const
@@ -133,6 +215,14 @@ struct Sim
 	}
 };
 
+static constexpr float kRealBias[3] = {-0.06f, 0.04f, 0.38f}; //!< Air 2 Ultra residual after factory cal (deg/s).
+
+static xrt_vec3
+real_bias()
+{
+	return {(float)rad(kRealBias[0]), (float)rad(kRealBias[1]), (float)rad(kRealBias[2])};
+}
+
 TEST_CASE("imu_3dof_gyro_bias: flag off keeps the old behaviour")
 {
 	Sim sim(false);
@@ -147,35 +237,52 @@ TEST_CASE("imu_3dof_gyro_bias: flag off keeps the old behaviour")
 	CHECK(std::abs(sim.yaw_error_deg()) > 5.0);
 }
 
-TEST_CASE("imu_3dof_gyro_bias: constant bias at rest converges and bounds drift")
+TEST_CASE("imu_3dof_gyro_bias: worn, real-capture statistics")
 {
-	// Observed on the XREAL 1S: ~2 deg/min = 0.033 deg/s yaw drift at rest.
-	const xrt_vec3 bias = {(float)rad(0.02), (float)rad(0.05), (float)rad(-0.03)};
-
+	// The real failure: a 0.38 deg/s stale bias on a horizontal axis plus head
+	// sway kept every block above the old 0.25 deg/s magnitude gate.
 	Sim base(false);
 	Sim sim(true);
-	base.bias = bias;
-	sim.bias = bias;
+	base.wear();
+	sim.wear();
+	base.bias = real_bias();
+	sim.bias = real_bias();
 
-	base.rest(15 * 60);
+	sim.rest(240);
+	double drift = sim.drift_deg_min(120);
+	base.rest(240);
+	double base_drift = base.drift_deg_min(120);
+
+	xrt_vec3 b = sim.fusion.gyro_bias.value;
+	std::printf("worn: bias [%.3f %.3f %.3f] deg/s (true %.2f %.2f %.2f), commits %u, rejects %u/%u/%u\n", deg(b.x),
+	            deg(b.y), deg(b.z), kRealBias[0], kRealBias[1], kRealBias[2], sim.fusion.bias_est.commits,
+	            sim.fusion.bias_est.rejects_sample, sim.fusion.bias_est.rejects_block,
+	            sim.fusion.bias_est.rejects_yaw);
+	std::printf("  yaw drift over minutes 4-6: baseline %.2f deg/min, estimator %.2f deg/min\n", base_drift, drift);
+
+	CHECK(sim.fusion.bias_est.commits > 20);
+	CHECK(std::abs(sim.yaw_bias_error_deg_s()) < 0.02);
+	CHECK(sim.bias_error_len_deg_s() < 0.08);
+	CHECK(std::abs(base_drift) > 2.0);
+	CHECK(std::abs(drift) < 1.0);
+}
+
+TEST_CASE("imu_3dof_gyro_bias: on a table, a large vertical offset is learned")
+{
+	// Face up on a desk the 0.38 deg/s axis is the yaw axis: far above the yaw
+	// gate, but the blocks barely scatter, which no head can do.
+	Sim sim(true);
+	sim.bias = {(float)rad(kRealBias[0]), (float)rad(kRealBias[2]), (float)rad(kRealBias[1])};
 	sim.rest(30);
 	double err_30s = sim.bias_error_len_deg_s();
-	double yaw_30s = sim.yaw_error_deg();
-	sim.rest(15 * 60 - 30);
+	sim.rest(90);
+	double drift = sim.drift_deg_min(120);
 
-	std::printf("rest 15 min: baseline yaw drift %.2f deg, estimator yaw drift %.3f deg\n", base.yaw_error_deg(),
-	            sim.yaw_error_deg());
-	std::printf("  bias error after 30 s %.4f deg/s, after 15 min %.5f deg/s, commits %u\n", err_30s,
-	            sim.bias_error_len_deg_s(), sim.fusion.bias_est.commits);
-
-	CHECK(std::abs(base.yaw_error_deg()) > 40.0);
-	// Startup fast-converge: most of the 0.062 deg/s bias is gone within 30 s.
-	CHECK(err_30s < 0.01);
-	CHECK(sim.bias_error_len_deg_s() < 0.003);
-	// Whole-run yaw drift is bounded to what accumulated while converging.
-	CHECK(std::abs(sim.yaw_error_deg()) < 1.0);
-	// And after convergence there is essentially no further drift.
-	CHECK(std::abs(sim.yaw_error_deg() - yaw_30s) < 0.5);
+	std::printf("table: bias error after 30 s %.4f, after 2 min %.4f deg/s, drift %.3f deg/min, quiet %d\n",
+	            err_30s, sim.bias_error_len_deg_s(), drift, sim.fusion.bias_est.is_quiet);
+	CHECK(sim.fusion.bias_est.is_quiet);
+	CHECK(sim.bias_error_len_deg_s() < 0.005);
+	CHECK(std::abs(drift) < 0.2);
 }
 
 TEST_CASE("imu_3dof_gyro_bias: thermal step in bias re-converges")
@@ -197,11 +304,10 @@ TEST_CASE("imu_3dof_gyro_bias: thermal step in bias re-converges")
 	std::printf("bias step 0.03->0.09 deg/s: error after 60 s %.4f, after 120 s %.5f deg/s, yaw lost %.2f deg\n",
 	            err_60, err_120, yaw_gain);
 
-	// Time constant 20 s (+3.5 s gate latency): ~5% left after 60 s.
-	CHECK(std::abs(err_60) < 0.006);
-	CHECK(std::abs(err_120) < 0.002);
-	// Total yaw lost to the step ~= step * tau = 0.06 * ~23 s.
-	CHECK(std::abs(yaw_gain) < 2.0);
+	// Learning lags by the 32 s held window, then converges within a few blocks.
+	CHECK(std::abs(err_60) < 0.01);
+	CHECK(std::abs(err_120) < 0.003);
+	CHECK(std::abs(yaw_gain) < 3.0);
 }
 
 TEST_CASE("imu_3dof_gyro_bias: motion bursts never adapt")
@@ -209,8 +315,8 @@ TEST_CASE("imu_3dof_gyro_bias: motion bursts never adapt")
 	Sim sim(true);
 	sim.bias = {0, (float)rad(0.05), 0};
 
-	// 10 minutes of 1 s head turns (+-30 deg/s) separated by 2 s still - always
-	// shorter than the still period, so the estimator must never learn.
+	// 10 minutes of 1 s head turns (+-30 deg/s) separated by 2 s still - after
+	// settling never a full block, so the estimator must never learn.
 	for (int i = 0; i < 200; i++) {
 		double dir = (i % 2) ? 1.0 : -1.0;
 		for (int s = 0; s < 1000; s++) {
@@ -241,94 +347,94 @@ TEST_CASE("imu_3dof_gyro_bias: linear acceleration blocks adaptation")
 	CHECK(sim.fusion.bias_est.commits == 0);
 }
 
-TEST_CASE("imu_3dof_gyro_bias: zero-mean head sway still learns")
-{
-	Sim sim(true);
-	sim.bias = {0, (float)rad(0.05), 0};
-
-	// Worn and fixating: +-0.2 deg sway at 0.3 Hz (peak 0.38 deg/s) - oscillatory,
-	// so it mostly cancels within a block; what is left averages out over blocks.
-	const double amp = rad(0.2);
-	const double w = 2.0 * M_PI * 0.3;
-	for (int i = 0; i < 300 * 1000; i++) {
-		double t = i / kRateHz;
-		sim.step(amp * w * std::cos(w * t));
-	}
-
-	std::printf("head sway: bias error %.4f deg/s, commits %u\n", sim.yaw_bias_error_deg_s(),
-	            sim.fusion.bias_est.commits);
-	CHECK(sim.fusion.bias_est.commits > 0);
-	CHECK(std::abs(sim.yaw_bias_error_deg_s()) < 0.015);
-}
-
 /*
- * The documented trade-off: a directed rotation is only distinguishable from
- * bias by its rate. Above the mean gate nothing leaks; below it, a pan that
- * outlasts the still period is (partly) learned as bias and leaks back out as
- * drift after it ends, bounded by the deviation clamp.
+ * The documented trade-off: a directed yaw rotation is only distinguishable
+ * from bias by its rate and by not scattering like a still head. Above the
+ * long-window yaw gate nothing leaks; below it, a pan is (partly) learned as
+ * bias and leaks back out as drift after it ends, bounded by the deviation
+ * clamp.
  */
 static void
 run_pan(double rate_deg_s, double seconds, double *out_yaw_err_end, double *out_yaw_err_after, double *out_bias)
 {
 	Sim sim(true);
-	sim.bias = {0, (float)rad(0.03), 0};
-	sim.rest(120); // Converged.
+	sim.wear();
+	sim.bias = real_bias();
+	sim.rest(300); // Converged.
 	double yaw0 = sim.yaw_error_deg();
 
 	sim.rotate(rate_deg_s, seconds);
 	*out_yaw_err_end = sim.yaw_error_deg() - yaw0;
 	*out_bias = sim.yaw_bias_error_deg_s();
 
-	sim.rest(120); // Let it re-learn.
+	sim.rest(300); // Let it re-learn.
 	*out_yaw_err_after = sim.yaw_error_deg() - yaw0;
 }
 
-TEST_CASE("imu_3dof_gyro_bias: slow pans")
+TEST_CASE("imu_3dof_gyro_bias: slow pans while worn")
 {
 	struct
 	{
 		double rate;
 		double seconds;
 	} pans[] = {
-	    {30.0, 6.0}, {5.0, 20.0}, {2.0, 30.0}, {1.0, 30.0}, {0.5, 30.0}, {0.3, 60.0}, {0.2, 60.0}, {0.1, 120.0},
+	    {30.0, 6.0}, {5.0, 20.0}, {2.0, 30.0}, {1.0, 30.0},  {0.5, 30.0},
+	    {0.5, 8.0},  {0.3, 60.0}, {0.2, 60.0}, {0.1, 120.0}, {0.05, 300.0},
 	};
 
-	std::printf("pan rate  dur  | yaw err at end | bias err at end | yaw err 120s later\n");
+	// Same seed and sample count without the pan: what the worn estimate drifts anyway.
+	double control_end = 0, control_after = 0, control_bias = 0;
+	run_pan(0.0, 60.0, &control_end, &control_after, &control_bias);
+	std::printf("worn, no pan: yaw err %.3f deg after 60+300 s\n", control_after);
+
+	std::printf("worn pan rate  dur  (angle)  | leak at end | bias err at end | leak 300 s later\n");
 	for (auto &p : pans) {
 		double end = 0, after = 0, bias = 0;
 		run_pan(p.rate, p.seconds, &end, &after, &bias);
-		std::printf("%5.2f deg/s %4.0fs | %8.3f deg   | %9.4f deg/s | %8.3f deg\n", p.rate, p.seconds, end,
-		            bias, after);
+		run_pan(0.0, p.seconds, &control_end, &control_after, &control_bias);
+		double leak_end = end - control_end;
+		double leak_after = after - control_after;
+		std::printf("%5.2f deg/s %4.0fs (%5.1f deg) | %8.3f deg | %9.4f deg/s | %8.3f deg\n", p.rate, p.seconds,
+		            p.rate * p.seconds, leak_end, bias - control_bias, leak_after);
 
-		if (p.rate > 0.25) {
-			// Above the block gate: no leak at all.
-			CHECK(std::abs(end) < 0.1);
-			CHECK(std::abs(after) < 0.2);
-		} else {
-			// Below it: the learned bias is bounded by the rate and the deviation clamp.
-			CHECK(std::abs(bias) <= p.rate + 0.01);
-			CHECK(std::abs(bias) <= 0.5 + 0.01);
+		if (p.rate >= 0.3) {
+			// Above the long-window yaw gate: nothing is learned from the pan. (The
+			// leak columns then only show the worn estimate's own noise, ~1 deg/5 min.)
+			CHECK(std::abs(bias - control_bias) < 0.01);
 		}
+		// Whatever is learned stays bounded by the rate.
+		CHECK(std::abs(bias - control_bias) <= p.rate + 0.01);
 	}
 }
 
-
-TEST_CASE("imu_3dof_gyro_bias: deviation clamp and reset")
+TEST_CASE("imu_3dof_gyro_bias: off-head limits and reset")
 {
-	Sim sim(true);
-	// Open the gate wide so a large bias is visible to the estimator at all.
-	sim.fusion.bias_est.params.gate_block_deg_s = 5.0f;
-	sim.bias = {0, (float)rad(1.0), 0};
-	sim.rest(300);
+	// A turntable: perfectly smooth 0.8 deg/s about gravity is "quiet", so it is
+	// taken for bias (nothing tells them apart), but 1.5 deg/s is over the clamp.
+	Sim slow(true);
+	slow.bias = {0, (float)rad(0.8), 0};
+	slow.rest(300);
+	Sim fast(true);
+	fast.bias = {0, (float)rad(1.5), 0};
+	fast.rest(300);
+	// Horizontal offsets are learned up to the deviation clamp.
+	Sim horiz(true);
+	horiz.bias = {(float)rad(1.5), 0, 0};
+	horiz.rest(300);
 
-	std::printf("clamp: true bias 1.0 deg/s, estimate %.4f deg/s\n", deg(sim.fusion.gyro_bias.value.y));
-	CHECK(deg(sim.fusion.gyro_bias.value.y) == Catch::Approx(0.5).margin(1e-4));
+	std::printf("turntable 0.8 -> %.4f, turntable 1.5 -> %.4f, horizontal 1.5 -> %.4f deg/s\n",
+	            deg(slow.fusion.gyro_bias.value.y), deg(fast.fusion.gyro_bias.value.y),
+	            deg(horiz.fusion.gyro_bias.value.x));
+	CHECK(deg(slow.fusion.gyro_bias.value.y) == Catch::Approx(0.8).margin(0.005));
+	CHECK(fast.fusion.bias_est.commits == 0);
+	CHECK(deg(horiz.fusion.gyro_bias.value.x) == Catch::Approx(1.0).margin(1e-3));
 
 	// Tuned params survive a reset, the learned state does not.
-	m_imu_3dof_reset(&sim.fusion);
-	CHECK(sim.fusion.bias_est.params.gate_block_deg_s == 5.0f);
-	CHECK(sim.fusion.bias_est.commits == 0);
-	CHECK(sim.fusion.gyro_bias.value.y == 0.0f);
+	horiz.fusion.bias_est.params.gate_block_deg_s = 5.0f;
+	m_imu_3dof_reset(&horiz.fusion);
+	CHECK(horiz.fusion.bias_est.params.gate_block_deg_s == 5.0f);
+	CHECK(horiz.fusion.bias_est.commits == 0);
+	CHECK(horiz.fusion.gyro_bias.value.x == 0.0f);
 }
 
 TEST_CASE("imu_3dof_gyro_bias: params parse and print round-trip")
@@ -336,23 +442,73 @@ TEST_CASE("imu_3dof_gyro_bias: params parse and print round-trip")
 	struct m_imu_3dof_gyro_bias_params p;
 	m_imu_3dof_gyro_bias_params_default(&p);
 
-	CHECK(m_imu_3dof_gyro_bias_params_parse(&p, "tau_s=30, gate_block_deg_s=0.2 held_blocks=4,enabled=0"));
-	CHECK(p.tau_s == 30.0f);
-	CHECK(p.gate_block_deg_s == 0.2f);
+	CHECK(m_imu_3dof_gyro_bias_params_parse(&p, "block_s=3, gate_yaw_deg_s=0.5 held_blocks=4,enabled=0"));
+	CHECK(p.block_s == 3.0f);
+	CHECK(p.gate_yaw_deg_s == 0.5f);
 	CHECK(p.held_blocks == 4);
 	CHECK_FALSE(p.enabled);
 
 	CHECK_FALSE(m_imu_3dof_gyro_bias_params_parse(&p, "nope=1"));
-	CHECK_FALSE(m_imu_3dof_gyro_bias_params_parse(&p, "tau_s"));
-	CHECK_FALSE(m_imu_3dof_gyro_bias_params_parse(&p, "tau_s=abc"));
+	CHECK_FALSE(m_imu_3dof_gyro_bias_params_parse(&p, "block_s"));
+	CHECK_FALSE(m_imu_3dof_gyro_bias_params_parse(&p, "block_s=abc"));
 
-	char buf[512];
+	char buf[1024];
 	m_imu_3dof_gyro_bias_params_print(&p, buf, sizeof(buf));
 	struct m_imu_3dof_gyro_bias_params q;
 	m_imu_3dof_gyro_bias_params_default(&q);
 	REQUIRE(m_imu_3dof_gyro_bias_params_parse(&q, buf));
-	CHECK(q.tau_s == p.tau_s);
+	CHECK(q.block_s == p.block_s);
 	CHECK(q.held_blocks == p.held_blocks);
 	CHECK(q.enabled == p.enabled);
 	CHECK(q.max_dev_deg_s == p.max_dev_deg_s);
+}
+
+/*
+ * Replay of a real XREAL_AIR_IMU_DUMP capture, hidden by default. Run with
+ *   M_IMU_3DOF_CAPTURE=~/xreal-captures/xreal-imu-20261012-212557.csv \
+ *     tests_imu_3dof_gyro_bias "[.capture]"
+ * The capture is 5.4 min worn, holding still; its whole-capture mean rate is
+ * [-0.06 0.04 0.38] deg/s.
+ */
+TEST_CASE("imu_3dof_gyro_bias: real worn capture", "[.capture]")
+{
+	const char *path = std::getenv("M_IMU_3DOF_CAPTURE");
+	if (path == nullptr) {
+		SKIP("M_IMU_3DOF_CAPTURE not set");
+	}
+	FILE *file = std::fopen(path, "r");
+	REQUIRE(file != nullptr);
+
+	struct m_imu_3dof fusion;
+	m_imu_3dof_init(&fusion, M_IMU_3DOF_USE_GRAVITY_DUR_20MS | M_IMU_3DOF_AUTO_GYRO_BIAS);
+
+	char line[1024];
+	uint64_t count = 0;
+	int64_t last_ns = 0;
+	while (std::fgets(line, sizeof(line), file) != nullptr) {
+		if (line[0] == '#' || std::strncmp(line, "device_ns", 9) == 0) {
+			continue;
+		}
+		unsigned long long dev = 0;
+		long long fus = 0;
+		xrt_vec3 g, a;
+		if (std::sscanf(line, "%llu,%lld,%*d,%*f,%f,%f,%f,%f,%f,%f", &dev, &fus, &g.x, &g.y, &g.z, &a.x, &a.y,
+		                &a.z) != 8 ||
+		    fus < last_ns) {
+			continue;
+		}
+		last_ns = fus;
+		m_imu_3dof_update(&fusion, (uint64_t)fus, &a, &g);
+		count++;
+	}
+	std::fclose(file);
+
+	xrt_vec3 b = fusion.gyro_bias.value;
+	std::printf("capture: %llu samples, %u blocks learned, bias [%.4f %.4f %.4f] deg/s\n",
+	            (unsigned long long)count, fusion.bias_est.commits, deg(b.x), deg(b.y), deg(b.z));
+	CHECK(fusion.bias_est.commits > 0);
+	CHECK(deg(b.y) == Catch::Approx(0.042).margin(0.015));
+	CHECK(deg(b.z) == Catch::Approx(0.378).margin(0.05));
+
+	m_imu_3dof_close(&fusion);
 }

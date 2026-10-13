@@ -25,13 +25,20 @@ extern "C" {
  * Opt-in: continuously re-estimate the gyro bias while the device is still.
  *
  * Gravity correction only observes pitch and roll, so any residual gyro bias
- * integrates into an unbounded yaw drift. With this flag the fusion watches for
- * sustained stillness (low mean angular rate, no rate spikes, accelerometer at
- * ~1g with no jitter) and slowly low-pass tracks the residual rate into
- * @ref m_imu_3dof::gyro_bias. The approach follows the stationary-gated
- * high-pass offset tracker of x-io's Fusion library (FusionBias, MIT), with a
- * mean-rate gate, a deferred commit and slew/deviation clamps added so slow
- * deliberate head motion is not absorbed. See @ref m_imu_3dof_gyro_bias_params.
+ * integrates into an unbounded yaw drift. With this flag the fusion collects
+ * the bias-corrected rate in short blocks while nothing moves fast (no rate
+ * spikes, accelerometer at ~1g without jitter) and feeds blocks that agree with
+ * each other into a small Kalman filter on @ref m_imu_3dof::gyro_bias.
+ *
+ * The components are treated by observability. Rotation about gravity (yaw) is
+ * exactly what a slow deliberate head pan looks like, so the gravity-aligned
+ * residual has to stay small and consistent over every recent window of
+ * blocks; the horizontal components are cross-checked by gravity correction and
+ * may be anything up to the deviation clamp. When the blocks barely scatter at
+ * all (the device lies on a table, no head attached) the yaw gate opens up to
+ * the deviation clamp as well. The idea of stationary-gated offset tracking is
+ * from x-io's Fusion library (FusionBias, MIT); this is a reimplementation with
+ * different gating. See @ref m_imu_3dof_gyro_bias_params.
  */
 #define M_IMU_3DOF_AUTO_GYRO_BIAS (1 << 2)
 
@@ -39,7 +46,7 @@ extern "C" {
 struct m_ff_vec3_f32;
 
 //! Maximum number of still blocks held back before being learned from.
-#define M_IMU_3DOF_BIAS_EST_MAX_HELD 8
+#define M_IMU_3DOF_BIAS_EST_MAX_HELD 16
 
 /*!
  * Tunables for @ref M_IMU_3DOF_AUTO_GYRO_BIAS. Angular quantities are in degrees
@@ -50,29 +57,39 @@ struct m_imu_3dof_gyro_bias_params
 	//! Runtime switch, only has an effect when the flag was given at init.
 	bool enabled;
 
-	//! Gate: magnitude of the mean bias-corrected angular rate over one block (deg/s).
-	float gate_block_deg_s;
-	//! Gate: magnitude of any single bias-corrected angular rate sample (deg/s).
+	//! Sample gate: magnitude of any single bias-corrected angular rate sample (deg/s).
 	float gate_sample_deg_s;
-	//! Gate: how far the mean acceleration magnitude may be from 1g (m/s^2).
+	//! Sample gate: how far the mean acceleration magnitude may be from 1g (m/s^2).
 	float gate_accel_m_s2;
-	//! Gate: how far any single acceleration sample may be from the mean (m/s^2).
+	//! Sample gate: how far any single acceleration sample may be from the mean (m/s^2).
 	float gate_accel_jitter_m_s2;
 	//! Time constant of the running acceleration mean (s).
 	float accel_window_s;
-	//! All gates must have passed for this long before a block may be learned (s).
-	float still_period_s;
-	//! Stillness is judged and learned in blocks of this length (s).
+	//! After a sample gate failed, blocks starting within this time are dropped (s).
+	float settle_s;
+
+	//! Rates are collected in blocks of this length (s).
 	float block_s;
-	//! A block is only learned once this many newer blocks also passed, so the
-	//! start of a slow motion is discarded rather than learned [1, M_IMU_3DOF_BIAS_EST_MAX_HELD].
+	//! Block gate: magnitude of a block's mean bias-corrected rate (deg/s).
+	float gate_block_deg_s;
+	//! Window gate: the gravity-aligned (yaw) residual averaged over the newest N
+	//! blocks must stay below gate_yaw_deg_s / sqrt(N) ...
+	float gate_yaw_deg_s;
+	//! ... but never below this (deg/s); slower directed yaw rotation is learned.
+	float gate_yaw_min_deg_s;
+	//! Blocks held back, and checked as windows, before the oldest is learned
+	//! [1, M_IMU_3DOF_BIAS_EST_MAX_HELD].
 	int32_t held_blocks;
-	//! Bias tracking time constant (s).
-	float tau_s;
-	//! Bias tracking time constant during the first @ref fast_period_s of learning (s).
-	float fast_tau_s;
-	//! Seconds of learned stillness that use @ref fast_tau_s.
-	float fast_period_s;
+	//! Per-axis scatter of the held block means below which the device is
+	//! considered off-head; the yaw gate then opens up to @ref max_dev_deg_s (deg/s).
+	float quiet_spread_deg_s;
+
+	//! Floor of the per-block measurement noise (deg/s).
+	float noise_floor_deg_s;
+	//! Prior uncertainty of the bias at init (deg/s).
+	float init_sd_deg_s;
+	//! Random walk of the true bias, e.g. with temperature (deg/s per sqrt(s)).
+	float walk_deg_s_sqrt_s;
 	//! Maximum bias change per second of learned stillness (deg/s per s).
 	float max_slew_deg_s2;
 	//! Maximum distance of the estimate from the bias at init (deg/s).
@@ -133,35 +150,46 @@ struct m_imu_3dof
 		//! @ref gyro_bias value the estimate may not stray far from.
 		struct xrt_vec3 origin;
 
-		//! Running mean of the acceleration, feeds the accel gates.
+		//! Running mean of the acceleration, feeds the accel gates and gives "up".
 		struct xrt_vec3 accel_mean;
 		bool accel_mean_valid;
 
-		//! Last time any gate failed.
-		uint64_t still_start_ns;
+		//! Blocks starting before this are dropped.
+		uint64_t settle_until_ns;
 
 		//! Block currently being accumulated (bias-corrected rate * dt).
 		struct xrt_vec3 block_sum;
 		double block_dt;
 		uint64_t block_start_ns;
 
-		//! Completed still blocks awaiting learning, oldest first, absolute rates.
+		//! Completed blocks awaiting learning, oldest first.
 		struct
 		{
-			struct xrt_vec3 rate;
+			struct xrt_vec3 rate; //!< Absolute mean rate (rad/s).
+			struct xrt_vec3 up;   //!< Gravity direction (unit) during the block.
 			double dt;
-			uint64_t start_ns;
 		} held[M_IMU_3DOF_BIAS_EST_MAX_HELD];
 		int32_t held_count;
 
-		//! Total learned stillness (s), selects the fast time constant.
+		//! Kalman variance of each bias component (rad^2/s^2).
+		double var;
+		bool var_valid;
+		uint64_t last_learn_ns;
+
+		//! Total learned block time (s).
 		double learned_s;
 
 		// Debug output.
 		struct xrt_vec3 last_block_rate; //!< Bias-corrected mean of the last block.
+		float spread_deg_s;              //!< Per-axis scatter of the held blocks.
+		float window_yaw_deg_s;          //!< Yaw residual of the full held window.
+		float sd_deg_s;                  //!< Current estimate uncertainty.
 		bool is_still;
-		float still_s;
+		bool is_quiet;
 		uint32_t commits;
+		uint32_t rejects_sample;
+		uint32_t rejects_block;
+		uint32_t rejects_yaw;
 	} bias_est;
 };
 
@@ -172,7 +200,7 @@ void
 m_imu_3dof_gyro_bias_params_default(struct m_imu_3dof_gyro_bias_params *p);
 
 /*!
- * Override tunables from a string like "tau_s=30,gate_block_deg_s=0.2", keys are
+ * Override tunables from a string like "gate_yaw_min_deg_s=0.1,block_s=3", keys are
  * the field names of @ref m_imu_3dof_gyro_bias_params, separated by commas or
  * whitespace. Meant for env vars and offline tools.
  *
