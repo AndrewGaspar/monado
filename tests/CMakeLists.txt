@@ -50,7 +50,7 @@ if(XRT_BUILD_DRIVER_HANDTRACKING)
 	list(APPEND tests tests_levenbergmarquardt)
 endif()
 if(XRT_BUILD_DRIVER_XREAL_AIR)
-	list(APPEND tests tests_xreal_air_camera_decode)
+	list(APPEND tests tests_xreal_air_camera_decode tests_xreal_air_camera_pairing)
 endif()
 
 foreach(testname ${tests})
@@ -135,5 +135,12 @@ if(XRT_BUILD_DRIVER_XREAL_AIR)
 		)
 	target_include_directories(
 		tests_xreal_air_camera_decode PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers
+		)
+	target_sources(
+		tests_xreal_air_camera_pairing
+		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/xreal_air/xreal_air_camera_pairing.c
+		)
+	target_include_directories(
+		tests_xreal_air_camera_pairing PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers
 		)
 endif()
