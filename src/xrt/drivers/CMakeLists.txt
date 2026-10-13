@@ -133,6 +133,8 @@ if(XRT_BUILD_DRIVER_XREAL_AIR)
 		drv_xreal_air
 		PRIVATE xreal_air/xreal_air_camera_decode.h
 			xreal_air/xreal_air_camera_decode.c
+			xreal_air/xreal_air_camera_pairing.h
+			xreal_air/xreal_air_camera_pairing.c
 			xreal_air/xreal_air_camera.h
 			xreal_air/xreal_air_camera.c
 			xreal_air/xreal_air_capture.h

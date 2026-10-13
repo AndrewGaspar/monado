@@ -10,6 +10,7 @@
 #include "xreal_air_capture.h"
 #include "xreal_air_camera.h"
 #include "xreal_air_camera_decode.h"
+#include "xreal_air_camera_pairing.h"
 #include "xreal_air_record.h"
 
 #include "math/m_clock_tracking.h"
@@ -42,6 +43,8 @@ DEBUG_GET_ONCE_OPTION(xreal_air_camera_device, "XREAL_AIR_CAMERA_DEVICE", NULL)
  * carries its own transport latency, ~26 ms apart).
  */
 DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_camera_own_clock, "XREAL_AIR_CAMERA_OWN_CLOCK", false)
+//! Maximum exposure time difference (device clock) of the two frames of a stereo pair.
+DEBUG_GET_ONCE_NUM_OPTION(xreal_air_pair_tolerance_us, "XREAL_AIR_PAIR_TOLERANCE_US", 1000)
 
 #define CAP_INFO(c, ...) U_LOG_IFL_I((c)->log_level, "Xreal Air capture: " __VA_ARGS__)
 // One-shot lifecycle / diagnostics lines, at WARN so they show at the driver's default log level.
@@ -105,11 +108,8 @@ struct xreal_air_capture
 	} imu_rate;
 
 	// Camera thread only.
-	struct
-	{
-		struct xrt_frame *frame;
-		struct xreal_air_record_cam_frame info;
-	} pending[2];
+	struct xreal_air_cam_pairer pairer;
+	uint64_t mismatches_warned;
 	int64_t last_pair_euroc_ns;
 
 	struct
@@ -125,6 +125,7 @@ struct xreal_air_capture
 		uint64_t cam_fallbacks;         //!< Frames whose device time could not be mapped.
 		uint64_t imu_fallbacks;         //!< IMU samples whose device time could not be mapped.
 		uint64_t pairs_own_clock;       //!< Pairs timed through the camera's own clock mapping.
+		uint64_t pairs_out_of_order;    //!< Pairs not newer than the previous one, not recorded.
 	} gui;
 };
 
@@ -285,13 +286,72 @@ record_btn_cb(void *ptr)
  *
  */
 
-static void
-drop_pending(struct xreal_air_capture *cap, int i)
+//! A decoded frame waiting in the pairer.
+struct pair_item
 {
-	if (cap->pending[i].frame != NULL) {
-		cap->gui.unpaired++;
+	struct xrt_frame *frame;
+	struct xreal_air_record_cam_frame info;
+};
+
+static void
+free_pair_item(struct pair_item *it)
+{
+	xrt_frame_reference(&it->frame, NULL);
+	free(it);
+}
+
+//! Pairer callback: a frame that will never be paired, still gets its telemetry row.
+static void
+on_unpaired(void *ctx, void *item)
+{
+	struct xreal_air_capture *cap = (struct xreal_air_capture *)ctx;
+	struct pair_item *it = (struct pair_item *)item;
+
+	cap->gui.unpaired++;
+
+	os_mutex_lock(&cap->lock);
+	if (cap->record != NULL) {
+		xreal_air_record_push_cam_frame(cap->record, &it->info);
 	}
-	xrt_frame_reference(&cap->pending[i].frame, NULL);
+	os_mutex_unlock(&cap->lock);
+
+	free_pair_item(it);
+}
+
+//! Pairer callback: a true stereo pair (same exposure).
+static void
+on_pair(void *ctx, void *left_item, void *right_item)
+{
+	struct xreal_air_capture *cap = (struct xreal_air_capture *)ctx;
+	struct pair_item *items[2] = {(struct pair_item *)left_item, (struct pair_item *)right_item};
+
+	// One timestamp for the pair, the left exposure (they are within microseconds).
+	const int64_t pair_ns = pair_timestamp(cap, &items[XREAL_AIR_CAM_LEFT]->info);
+
+	// Auto exposure starts from zero after STREAMON, the first pairs are black.
+	const bool warmup = items[0]->info.telemetry.exposure == 0 || items[1]->info.telemetry.exposure == 0;
+	if (warmup) {
+		cap->gui.warmup++;
+	}
+
+	os_mutex_lock(&cap->lock);
+	if (cap->record != NULL && !warmup && pair_ns > cap->last_pair_euroc_ns) {
+		items[0]->info.euroc_ns = pair_ns;
+		items[1]->info.euroc_ns = pair_ns;
+		xreal_air_record_push_stereo(cap->record, pair_ns, items[0]->frame, items[1]->frame);
+		cap->last_pair_euroc_ns = pair_ns;
+	} else if (cap->record != NULL && !warmup) {
+		cap->gui.pairs_out_of_order++;
+	}
+	if (cap->record != NULL) {
+		xreal_air_record_push_cam_frame(cap->record, &items[0]->info);
+		xreal_air_record_push_cam_frame(cap->record, &items[1]->info);
+	}
+	os_mutex_unlock(&cap->lock);
+
+	cap->gui.pairs++;
+	free_pair_item(items[0]);
+	free_pair_item(items[1]);
 }
 
 static void
@@ -359,58 +419,26 @@ on_camera_frame(void *user, const struct xreal_air_camera_raw_frame *raw)
 	if (info.cam == XREAL_AIR_CAM_LEFT || info.cam == XREAL_AIR_CAM_RIGHT) {
 		u_sink_debug_push_frame(&cap->gui.sinks[info.cam], xf);
 
-		// Pair by counter, the order within a pair is not fixed.
-		const int self = (int)info.cam;
-		const int other = 1 - self;
-		if (cap->pending[other].frame != NULL &&
-		    cap->pending[other].info.telemetry.counter == info.telemetry.counter) {
-			struct xrt_frame *frames[2] = {NULL, NULL};
-			struct xreal_air_record_cam_frame *infos[2] = {NULL, NULL};
-			frames[self] = xf;
-			frames[other] = cap->pending[other].frame;
-			infos[self] = &info;
-			infos[other] = &cap->pending[other].info;
+		/*
+		 * Pair by the per-pair timestamp, cross-checked by exposure time. The counter is not a
+		 * pair key (it can increment on either camera), the arrival order is not fixed either.
+		 */
+		struct pair_item *it = U_TYPED_CALLOC(struct pair_item);
+		xrt_frame_reference(&it->frame, xf);
+		it->info = info;
+		const struct xreal_air_cam_pair_key key = {
+		    .cam = info.cam,
+		    .device_ns = info.telemetry.device_ns,
+		    .pair_ts = info.telemetry.pair_ts,
+		};
+		xreal_air_cam_pairer_push(&cap->pairer, &key, it);
 
-			// One timestamp for the pair, the left exposure (they are within microseconds).
-			const int64_t pair_ns = pair_timestamp(cap, infos[XREAL_AIR_CAM_LEFT]);
-
-			// Auto exposure starts from zero after STREAMON, the first pairs are black.
-			const bool warmup = infos[0]->telemetry.exposure == 0 || infos[1]->telemetry.exposure == 0;
-			if (warmup) {
-				cap->gui.warmup++;
-			}
-
-			os_mutex_lock(&cap->lock);
-			if (cap->record != NULL && !warmup && pair_ns > cap->last_pair_euroc_ns) {
-				infos[0]->euroc_ns = pair_ns;
-				infos[1]->euroc_ns = pair_ns;
-				xreal_air_record_push_stereo(cap->record, pair_ns, frames[0], frames[1]);
-				cap->last_pair_euroc_ns = pair_ns;
-			}
-			// The pending frame's telemetry row was held back for its euroc_ns.
-			if (cap->record != NULL) {
-				xreal_air_record_push_cam_frame(cap->record, infos[other]);
-				xreal_air_record_push_cam_frame(cap->record, infos[self]);
-			}
-			os_mutex_unlock(&cap->lock);
-
-			xrt_frame_reference(&cap->pending[other].frame, NULL);
-			cap->gui.pairs++;
-		} else {
-			// Whatever was pending for either camera will not be paired any more.
-			for (int i = 0; i < 2; i++) {
-				if (cap->pending[i].frame == NULL) {
-					continue;
-				}
-				os_mutex_lock(&cap->lock);
-				if (cap->record != NULL) {
-					xreal_air_record_push_cam_frame(cap->record, &cap->pending[i].info);
-				}
-				os_mutex_unlock(&cap->lock);
-				drop_pending(cap, i);
-			}
-			xrt_frame_reference(&cap->pending[self].frame, xf);
-			cap->pending[self].info = info;
+		if (cap->pairer.mismatches > 0 && cap->mismatches_warned == 0) {
+			cap->mismatches_warned = cap->pairer.mismatches;
+			CAP_NOTE(cap,
+			         "Stereo frames whose pair timestamp and exposure time disagree (device time %" PRIu64
+			         ", pair_ts %" PRIu64 "), not pairing them. Further ones are only counted.",
+			         info.telemetry.device_ns, info.telemetry.pair_ts);
 		}
 	}
 
@@ -486,6 +514,9 @@ xreal_air_capture_create(enum u_logging_level log_level)
 	cap->log_level = log_level;
 	cap->last_imu_euroc_ns = -1;
 	cap->last_pair_euroc_ns = -1;
+	xreal_air_cam_pairer_init(&cap->pairer,
+	                          (int64_t)debug_get_num_option_xreal_air_pair_tolerance_us() * U_TIME_1US_IN_NS,
+	                          on_pair, on_unpaired, cap);
 	(void)snprintf(cap->record_base, sizeof(cap->record_base), "%s", record ? record_path : "xreal_euroc");
 
 	if (os_mutex_init(&cap->lock) != 0) {
@@ -651,12 +682,13 @@ xreal_air_capture_destroy(struct xreal_air_capture **cap_ptr)
 	         " camera / %" PRIu64 " IMU",
 	         cap->gui.frames, cap->gui.pairs, cap->gui.unpaired, cap->gui.warmup, cap->gui.imu_samples,
 	         cap->gui.cam_fallbacks, cap->gui.imu_fallbacks);
-	CAP_NOTE(cap, "%" PRIu64 " pairs timed via the camera's own clock instead of the IMU clock",
-	         cap->gui.pairs_own_clock);
+	CAP_NOTE(cap,
+	         "%" PRIu64 " pairs timed via the camera's own clock instead of the IMU clock, %" PRIu64
+	         " out of order pairs skipped, %" PRIu64 " pair_ts / exposure time mismatches",
+	         cap->gui.pairs_own_clock, cap->gui.pairs_out_of_order, cap->pairer.mismatches);
 
-	for (int i = 0; i < 2; i++) {
-		xrt_frame_reference(&cap->pending[i].frame, NULL);
-	}
+	// Unpaired leftovers still get their telemetry rows.
+	xreal_air_cam_pairer_flush(&cap->pairer);
 
 	stop_record(cap);
 
