@@ -72,6 +72,32 @@ extern "C" {
 #define XREAL_AIR_MSG_GET_STATIC_ID 0x1A
 #define XREAL_AIR_MSG_UNKNOWN 0x1D
 
+#define XREAL_AIR_SLAM_CAMERA_COUNT 2
+#define XREAL_AIR_SLAM_CAMERA_MAX_KC 12
+
+/*!
+ * One SLAM camera of the factory "SLAM_camera" calibration (Air 2 Ultra), values as stored.
+ *
+ * For the "fisheye624" model the 12 @ref kc are radial k0..k5, tangential p0, p1 and thin
+ * prism s0..s3. @ref imu_q_cam is a JPL quaternion (as the blob's comment says), stored in the
+ * blob's (x, y, z, w) order and NOT converted, see the recorder for the conversion.
+ *
+ * @ingroup drv_xreal_air
+ */
+struct xreal_air_slam_camera_calibration
+{
+	bool valid;
+	char model[32];    //!< "fisheye624" on the Air 2 Ultra.
+	int resolution[2]; //!< [w, h], [480, 640] on the Air 2 Ultra (portrait).
+	double fc[2];      //!< Focal length (fx, fy) in pixels.
+	double cc[2];      //!< Principal point (cx, cy) in pixels.
+	int kc_count;      //!< Number of valid @ref kc.
+	double kc[XREAL_AIR_SLAM_CAMERA_MAX_KC];
+	double imu_p_cam[3]; //!< Camera position in the IMU frame, meters.
+	double imu_q_cam[4]; //!< JPL quaternion (x, y, z, w), verbatim.
+	double rolling_shutter_time;
+};
+
 struct xreal_air_parsed_calibration
 {
 	struct xrt_vec3 accel_bias;
@@ -100,6 +126,9 @@ struct xreal_air_parsed_calibration
 	bool distortion_valid;
 	int distortion_num_col[2];
 	int distortion_num_row[2];
+
+	//! The factory "SLAM_camera" object, device_1 (left) and device_2 (right).
+	struct xreal_air_slam_camera_calibration slam_camera[XREAL_AIR_SLAM_CAMERA_COUNT];
 };
 
 /*!
@@ -180,6 +209,15 @@ xreal_air_calibration_set_defaults(struct xreal_air_parsed_calibration *calibrat
 
 bool
 xreal_air_parse_calibration_buffer(struct xreal_air_parsed_calibration *calibration, const char *buffer, size_t size);
+
+/*!
+ * Recover the clean factory calibration JSON document from the reassembled (possibly rotated,
+ * zero padded) calibration buffer, for saving verbatim.
+ *
+ * @return A malloc'd NUL-terminated copy (caller frees) or NULL if no document was found.
+ */
+char *
+xreal_air_calibration_document(const char *buffer, size_t size, size_t *out_len);
 
 bool
 xreal_air_parse_sensor_packet(struct xreal_air_parsed_sensor *sensor,
