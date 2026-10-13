@@ -40,6 +40,8 @@ print_usage(const char *argv0)
 	P("  --params k=v,...  estimator tunables (struct m_imu_3dof_gyro_bias_params field names)\n");
 	P("  --every N         output every Nth sample (default 100, 10 Hz at 1 kHz)\n");
 	P("  --tail S          also fit drift over the last S seconds (default 300)\n");
+	P("  --device-clock    feed the fusion device timestamps instead of the host-anchored ones\n");
+	P("                    the live fusion saw (shows what USB/scheduling jitter costs)\n");
 	P("  --quiet           summary only, no CSV\n");
 }
 
@@ -148,6 +150,7 @@ cli_cmd_imu_replay(int argc, const char **argv)
 	long every = 100;
 	double tail_s = 300.0;
 	bool quiet = false;
+	bool device_clock = false;
 
 	for (int i = 2; i < argc; i++) {
 		if (strcmp(argv[i], "--params") == 0 && i + 1 < argc) {
@@ -156,6 +159,8 @@ cli_cmd_imu_replay(int argc, const char **argv)
 			every = strtol(argv[++i], NULL, 10);
 		} else if (strcmp(argv[i], "--tail") == 0 && i + 1 < argc) {
 			tail_s = strtod(argv[++i], NULL);
+		} else if (strcmp(argv[i], "--device-clock") == 0) {
+			device_clock = true;
 		} else if (strcmp(argv[i], "--quiet") == 0) {
 			quiet = true;
 		} else if (argv[i][0] != '-' && path == NULL) {
@@ -234,6 +239,10 @@ cli_cmd_imu_replay(int argc, const char **argv)
 		if (!parse_line(line, &s)) {
 			bad_lines++;
 			continue;
+		}
+
+		if (device_clock) {
+			s.fusion_ns = (int64_t)s.device_ns;
 		}
 
 		// The fusion needs forward progress.
