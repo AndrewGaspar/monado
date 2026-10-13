@@ -28,6 +28,8 @@
 #include "math/m_relation_history.h"
 #include "xrt/xrt_defines.h"
 
+#include "xreal_air_capture.h"
+
 #include <errno.h>
 #include <poll.h>
 #include <string.h>
@@ -127,6 +129,9 @@ struct xreal_air_hmd
 	bool calibration_valid;
 
 	struct xreal_air_parsed_calibration calibration;
+
+	//! Opt-in SLAM camera capture / dataset recording, NULL unless enabled by the environment.
+	struct xreal_air_capture *capture;
 
 	struct
 	{
@@ -336,6 +341,11 @@ update_fusion_locked(struct xreal_air_hmd *hmd, struct xreal_air_parsed_sample *
 {
 	read_sample_and_apply_calibration(hmd, sample, &hmd->read.accel, &hmd->read.gyro, &hmd->read.mag);
 	m_imu_3dof_update(&hmd->fusion, timestamp_ns, &hmd->read.accel, &hmd->read.gyro);
+
+	if (hmd->capture != NULL) {
+		xreal_air_capture_push_imu(hmd->capture, hmd->last.timestamp, (int64_t)timestamp_ns, sample,
+		                           hmd->read.temperature, &hmd->read.gyro, &hmd->read.accel);
+	}
 }
 
 static void
@@ -591,6 +601,11 @@ handle_sensor_control_cal_data_get_next_segment(struct xreal_air_hmd *hmd,
 		// starts via the 0xAA path in the read thread, but sending the explicit enable here matches
 		// the original Air and is harmless if already streaming.
 		request_sensor_control_start_imu_data(hmd, 0x01);
+
+		if (hmd->capture != NULL) {
+			xreal_air_capture_set_calibration(hmd->capture, hmd->calibration_buffer,
+			                                  hmd->calibration_buffer_len, &hmd->calibration);
+		}
 
 		// Free calibration buffer.
 		free(hmd->calibration_buffer);
@@ -1234,6 +1249,9 @@ teardown(struct xreal_air_hmd *hmd)
 	// Destroy the fusion.
 	m_imu_3dof_close(&hmd->fusion);
 
+	// After the sensor thread, which pushes into it, has stopped.
+	xreal_air_capture_destroy(&hmd->capture);
+
 	os_thread_helper_destroy(&hmd->oth);
 	os_mutex_destroy(&hmd->device_mutex);
 }
@@ -1501,6 +1519,9 @@ xreal_air_hmd_create_device(struct os_hid_device *sensor_device,
 	// Do mutex and thread init before any call to teardown happens.
 	os_mutex_init(&hmd->device_mutex);
 	os_thread_helper_init(&hmd->oth);
+
+	// Before the sensor thread starts, it feeds the capture.
+	hmd->capture = xreal_air_capture_create(hmd->log_level);
 
 	if (!sensor_device) {
 		goto cleanup;

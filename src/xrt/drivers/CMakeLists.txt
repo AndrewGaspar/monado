@@ -135,6 +135,8 @@ if(XRT_BUILD_DRIVER_XREAL_AIR)
 			xreal_air/xreal_air_camera_decode.c
 			xreal_air/xreal_air_camera.h
 			xreal_air/xreal_air_camera.c
+			xreal_air/xreal_air_capture.h
+			xreal_air/xreal_air_capture.c
 			xreal_air/xreal_air_record.h
 			xreal_air/xreal_air_record.c
 		)
