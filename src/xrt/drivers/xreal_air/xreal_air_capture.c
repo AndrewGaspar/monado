@@ -676,6 +676,9 @@ xreal_air_capture_destroy(struct xreal_air_capture **cap_ptr)
 	os_thread_helper_destroy(&cap->oth);
 	xreal_air_camera_destroy(&cap->camera);
 
+	// Unpaired leftovers still get their telemetry rows (and count in the stats below).
+	xreal_air_cam_pairer_flush(&cap->pairer);
+
 	CAP_NOTE(cap,
 	         "%" PRIu64 " camera frames, %" PRIu64 " pairs, %" PRIu64 " unpaired, %" PRIu64
 	         " zero exposure pairs skipped, %" PRIu64 " IMU samples, unmappable timestamps: %" PRIu64
@@ -686,9 +689,6 @@ xreal_air_capture_destroy(struct xreal_air_capture **cap_ptr)
 	         "%" PRIu64 " pairs timed via the camera's own clock instead of the IMU clock, %" PRIu64
 	         " out of order pairs skipped, %" PRIu64 " pair_ts / exposure time mismatches",
 	         cap->gui.pairs_own_clock, cap->gui.pairs_out_of_order, cap->pairer.mismatches);
-
-	// Unpaired leftovers still get their telemetry rows.
-	xreal_air_cam_pairer_flush(&cap->pairer);
 
 	stop_record(cap);
 
