@@ -10,6 +10,7 @@ set(tests
     tests_glue_device
     tests_history_buf
     tests_id_ringbuffer
+    tests_imu_3dof_gyro_bias
     tests_json
     tests_lowpass_float
     tests_lowpass_integer
@@ -61,6 +62,7 @@ endforeach()
 target_link_libraries(tests_cxx_wrappers PRIVATE xrt-interfaces)
 target_link_libraries(tests_glue_device PRIVATE xrt-interfaces aux_glue)
 target_link_libraries(tests_history_buf PRIVATE aux_math)
+target_link_libraries(tests_imu_3dof_gyro_bias PRIVATE aux_math)
 target_link_libraries(tests_lowpass_float PRIVATE aux_math)
 target_link_libraries(tests_lowpass_integer PRIVATE aux_math)
 target_link_libraries(tests_quatexpmap PRIVATE aux_math)
