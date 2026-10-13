@@ -34,6 +34,7 @@ cli_print_help(int argc, const char **argv)
 	P("  calibrate  - Calibrate a camera and save config (not implemented yet).\n");
 	P("  calib-dump - Load and dump a calibration to stdout.\n");
 	P("  slambatch  - Runs a sequence of EuRoC datasets with the SLAM tracker.\n");
+	P("  imu-replay - Replay an IMU dump through the 3DoF fusion, compare gyro bias estimation.\n");
 
 	return 1;
 }
@@ -67,6 +68,9 @@ main(int argc, const char **argv)
 	}
 	if (strcmp(argv[1], "slambatch") == 0) {
 		return cli_cmd_slambatch(argc, argv);
+	}
+	if (strcmp(argv[1], "imu-replay") == 0) {
+		return cli_cmd_imu_replay(argc, argv);
 	}
 	return cli_print_help(argc, argv);
 }

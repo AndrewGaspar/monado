@@ -7,6 +7,7 @@
 add_executable(
 	cli
 	cli_cmd_calibration_dump.c
+	cli_cmd_imu_replay.c
 	cli_cmd_info.c
 	cli_cmd_lighthouse.c
 	cli_cmd_probe.c
