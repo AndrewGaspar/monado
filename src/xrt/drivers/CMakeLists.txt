@@ -141,6 +141,11 @@ if(XRT_BUILD_DRIVER_XREAL_AIR)
 			xreal_air/xreal_air_record.c
 		)
 	target_link_libraries(drv_xreal_air PRIVATE aux_math aux_os xrt-external-stb)
+	if(ZLIB_FOUND)
+		target_link_libraries(drv_xreal_air PRIVATE ${ZLIB_LIBRARIES})
+		target_include_directories(drv_xreal_air PRIVATE ${ZLIB_INCLUDE_DIRS})
+		target_compile_definitions(drv_xreal_air PRIVATE XREAL_AIR_HAVE_ZLIB)
+	endif()
 	list(APPEND ENABLED_HEADSET_DRIVERS xreal_air)
 endif()
 
