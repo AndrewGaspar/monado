@@ -284,9 +284,13 @@ camera_thread(void *ptr)
 			cam->func(cam->user, &frame);
 			frames++;
 		} else {
+			// Typically the first frames after STREAMON, flagged as errored by uvcvideo.
 			short_frames++;
-			CAM_DEBUG(cam, "Dropping bad frame: index %u flags 0x%x bytesused %u", buf.index, buf.flags,
-			          buf.bytesused);
+			if (short_frames <= 16) {
+				CAM_INFO(cam, "Dropping bad frame: seq %u flags 0x%x (%s) bytesused %u", buf.sequence,
+				         buf.flags, (buf.flags & V4L2_BUF_FLAG_ERROR) != 0 ? "error" : "short",
+				         buf.bytesused);
+			}
 		}
 
 		if (xioctl(cam->fd, VIDIOC_QBUF, &buf) < 0) {

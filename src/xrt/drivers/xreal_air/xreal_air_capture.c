@@ -97,6 +97,7 @@ struct xreal_air_capture
 		uint64_t frames;
 		uint64_t pairs;
 		uint64_t unpaired;
+		uint64_t warmup; //!< Pairs with zero exposure, kept out of the dataset.
 		uint64_t imu_samples;
 		int64_t cam_minus_imu_clock_ns; //!< Camera clock minus IMU clock mapping of the same instant.
 	} gui;
@@ -283,8 +284,14 @@ on_camera_frame(void *user, const struct xreal_air_camera_raw_frame *raw)
 			// One timestamp for the pair, the left exposure (they are within microseconds).
 			const int64_t pair_ns = infos[XREAL_AIR_CAM_LEFT]->mapped_ns;
 
+			// Auto exposure starts from zero after STREAMON, the first pairs are black.
+			const bool warmup = infos[0]->telemetry.exposure == 0 || infos[1]->telemetry.exposure == 0;
+			if (warmup) {
+				cap->gui.warmup++;
+			}
+
 			os_mutex_lock(&cap->lock);
-			if (cap->record != NULL && pair_ns > cap->last_pair_euroc_ns) {
+			if (cap->record != NULL && !warmup && pair_ns > cap->last_pair_euroc_ns) {
 				infos[0]->euroc_ns = pair_ns;
 				infos[1]->euroc_ns = pair_ns;
 				xreal_air_record_push_stereo(cap->record, pair_ns, frames[0], frames[1]);
@@ -421,6 +428,7 @@ xreal_air_capture_create(enum u_logging_level log_level)
 	u_var_add_ro_u64(cap, &cap->gui.frames, "Camera frames");
 	u_var_add_ro_u64(cap, &cap->gui.pairs, "Stereo pairs");
 	u_var_add_ro_u64(cap, &cap->gui.unpaired, "Unpaired frames");
+	u_var_add_ro_u64(cap, &cap->gui.warmup, "Zero exposure pairs (skipped)");
 	u_var_add_ro_u64(cap, &cap->gui.imu_samples, "IMU samples");
 	u_var_add_ro_i64_ns(cap, &cap->gui.cam_minus_imu_clock_ns, "Camera minus IMU clock");
 	u_var_add_sink_debug(cap, &cap->gui.sinks[XREAL_AIR_CAM_LEFT], "Left (cam0)");
@@ -544,6 +552,11 @@ xreal_air_capture_destroy(struct xreal_air_capture **cap_ptr)
 	// Stop the open thread first, then the camera thread, so no more frames arrive.
 	os_thread_helper_destroy(&cap->oth);
 	xreal_air_camera_destroy(&cap->camera);
+
+	CAP_INFO(cap,
+	         "%" PRIu64 " camera frames, %" PRIu64 " pairs, %" PRIu64 " unpaired, %" PRIu64
+	         " zero exposure pairs skipped, %" PRIu64 " IMU samples",
+	         cap->gui.frames, cap->gui.pairs, cap->gui.unpaired, cap->gui.warmup, cap->gui.imu_samples);
 
 	for (int i = 0; i < 2; i++) {
 		xrt_frame_reference(&cap->pending[i].frame, NULL);

@@ -256,9 +256,11 @@ pose_compose(const struct pose_d *a, const struct pose_d *b, struct pose_d *out)
  *
  * imu_q_cam is documented in the blob as a JPL quaternion. A JPL quaternion's rotation matrix is
  * the transpose of the Hamilton one with the same components, so the Hamilton rotation taking
- * camera vectors into the IMU frame is the conjugate. Sanity check on the Air 2 Ultra values: this
- * reading makes both cameras pitch ~8 degrees down and toe out ~6 degrees, the plain Hamilton
- * reading would have them pitch up and toe in.
+ * camera vectors into the IMU frame is the conjugate. This reading makes both cameras pitch ~8
+ * degrees down and toe out ~6 degrees. Verified live on decoded stereo pairs: projecting far
+ * points from the left image into the right one through this T_imu_cam and the factory
+ * intrinsics lands within a few pixels vertically (and on the expected side horizontally,
+ * by the finite-depth disparity), while the plain Hamilton reading is off by ~100 px.
  */
 static void
 factory_T_imu_cam(const struct xreal_air_slam_camera_calibration *cam, struct pose_d *out)
@@ -469,6 +471,7 @@ static const char readme[] =
     "  cam0/          LEFT camera  (factory SLAM_camera device_1), 480x640 8-bit PNG, upright.\n"
     "  cam1/          RIGHT camera (factory SLAM_camera device_2), 480x640 8-bit PNG, upright.\n"
     "                 Both images of a stereo pair share one timestamp (the left exposure).\n"
+    "                 Pairs with zero exposure (auto exposure warm-up after start) are skipped.\n"
     "  imu0/data.csv  Gyro rad/s, accel m/s^2, factory calibrated, in the factory IMU frame\n"
     "                 (x right, y down, z forward) that imu_p_cam / imu_q_cam refer to.\n"
     "\n"
@@ -482,14 +485,14 @@ static const char readme[] =
     "                                T_imu_cam assumes imu_q_cam is JPL, i.e. Hamilton = conjugate.\n"
     "xreal/camchain-imucam.yaml      Kalibr style, same conversion. xreal/imu.yaml likewise.\n"
     "xreal/camera_frames.csv         Every camera frame (paired or not):\n"
-    "  cam             0 left, 1 right (from telemetry, never arrival order)\n"
+    "  cam             0 left, 1 right (telemetry byte 59, never arrival order)\n"
     "  v4l2_seq        V4L2 sequence number, gaps are frames dropped by the kernel\n"
     "  kernel_ns       V4L2 buffer timestamp, CLOCK_MONOTONIC\n"
     "  dequeue_ns      host CLOCK_MONOTONIC right after VIDIOC_DQBUF\n"
     "  device_ns       telemetry offset 0, device clock ns (power-on epoch)\n"
     "  counter         telemetry offset 18 (u16), stereo pair counter\n"
     "  exposure, gain  telemetry offsets 22 (u24) and 26 (u8)\n"
-    "  id58, id59      telemetry bytes 58 and 59 (camera id candidates)\n"
+    "  id58, id59      telemetry bytes 58 (always 0 so far) and 59 (the camera id, 1 = right)\n"
     "  pair_ts         telemetry offset 62 (u64), second per-pair timestamp\n"
     "  phase           descrambler phase\n"
     "  mapped_ns       device_ns mapped via the camera clock tracker\n"
