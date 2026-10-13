@@ -20,8 +20,10 @@
  * 480x640 (w x h) portrait image the factory "SLAM_camera" calibration describes.
  *
  * Sources: chunk map from mazeasdamien/myXreal, descramble from Luka Panio's /
- * Benjamin Berg's WIP Monado branch (gitlab.freedesktop.org/benzea/monado), telemetry
- * and orientation from sean9061/xreal-air2ultra-camera and DeskUnreal/xreal-vio-vr.
+ * Benjamin Berg's WIP Monado branch (gitlab.freedesktop.org/benzea/monado), which also gets
+ * the orientation and camera id right (verified live, see @ref xreal_air_cam_orient and
+ * @ref xreal_air_cam_identify), telemetry layout from sean9061/xreal-air2ultra-camera and
+ * DeskUnreal/xreal-vio-vr.
  *
  * @author Luka Panio <lukapanio@gmail.com>
  * @author Andrew Gaspar
@@ -73,8 +75,8 @@ struct xreal_air_cam_telemetry
 	uint16_t counter;   //!< Offset 18: stereo pair counter, shared by both frames of a pair.
 	uint32_t exposure;  //!< Offset 22: u24 exposure, ~ns (MED confidence).
 	uint8_t gain;       //!< Offset 26: gain / exposure index (MED-LOW confidence).
-	uint8_t id_byte58;  //!< Offset 58: 0x20 = right, 0x21 = left (sean9061 "cam0/cam1").
-	uint8_t id_byte59;  //!< Offset 59 (0x3b): non-zero = right (Berg / DeskUnreal).
+	uint8_t id_byte58;  //!< Offset 58: always 0 on our Air 2 Ultra (sean9061 saw 0x20/0x21), kept raw.
+	uint8_t id_byte59;  //!< Offset 59 (0x3b): camera id, 0 = left, 1 = right (verified live).
 	uint64_t pair_ts;   //!< Offset 62 (0x3e): second timestamp, same for both frames of a pair.
 	uint8_t raw[XREAL_AIR_CAM_TELEMETRY_RAW_LEN]; //!< Leading telemetry bytes, verbatim.
 };
@@ -92,10 +94,10 @@ xreal_air_cam_parse_telemetry(const uint8_t *raw, size_t size, struct xreal_air_
 /*!
  * Which camera a frame came from.
  *
- * Byte 58 is 0x20 for the right and 0x21 for the left camera (sean9061, verified against
- * image correlation). Byte 59 (0x3b) is non-zero for the right camera (Berg, DeskUnreal).
- * Both sources agree on which camera is the right one once their pixel mappings are
- * compared. Byte 58 is used when it holds one of its two known values, byte 59 otherwise.
+ * Byte 59 (0x3b) is non-zero for the right camera (Berg, DeskUnreal). Verified live on the
+ * user's unit (firmware of 2026-10): it alternates 0/1 within every pair while byte 58, which
+ * sean9061 documents as 0x20/0x21, is always 0, so byte 58 is not used. Stereo check: with
+ * this id and @ref xreal_air_cam_orient, near objects sit further right in the left image.
  */
 enum xreal_air_cam_id
 xreal_air_cam_identify(const struct xreal_air_cam_telemetry *t);
@@ -119,9 +121,11 @@ xreal_air_cam_descramble(const uint8_t *raw, uint8_t *out_readout);
 /*!
  * Orient a descrambled readout into the upright 480x640 (w x h) image of camera @p cam.
  *
- * Readout line r, pixel c lands at (x, y) = (r, c) for the right camera and at
- * (479 - r, 639 - c) for the left camera (sean9061 / DeskUnreal; note Berg's WIP branch
- * mirrors both images relative to this).
+ * Readout line r, pixel c lands at (x, y) = (479 - r, c) for the right camera and at
+ * (r, 639 - c) for the left camera, i.e. readout lines are image columns and the two cameras
+ * are 180 degrees opposed. This is Berg's mapping (left 90 degrees counter clockwise, right
+ * clockwise), verified live: it gives the true, non-mirrored view (sean9061 and DeskUnreal
+ * produce mirror images) and is the frame the factory SLAM_camera intrinsics are in.
  */
 void
 xreal_air_cam_orient(const uint8_t *readout, enum xreal_air_cam_id cam, uint8_t *out, size_t out_stride);

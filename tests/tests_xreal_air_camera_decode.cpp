@@ -97,10 +97,10 @@ TEST_CASE("xreal_air_cam_orient maps readout lines to image columns")
 	for (uint32_t r = 0; r < XREAL_AIR_CAM_READOUT_LINES; r += 7) {
 		for (uint32_t c = 0; c < XREAL_AIR_CAM_READOUT_LINE; c += 5) {
 			const uint8_t px = readout[r * XREAL_AIR_CAM_READOUT_LINE + c];
-			// Right: (x, y) = (r, c).
-			CHECK(right[c * stride + r] == px);
-			// Left: (x, y) = (479 - r, 639 - c), i.e. the right mapping rotated 180 degrees.
-			CHECK(left[(639 - c) * stride + (479 - r)] == px);
+			// Right: (x, y) = (479 - r, c).
+			CHECK(right[c * stride + (479 - r)] == px);
+			// Left: (x, y) = (r, 639 - c), i.e. the right mapping rotated 180 degrees.
+			CHECK(left[(639 - c) * stride + r] == px);
 		}
 	}
 }
@@ -160,15 +160,13 @@ TEST_CASE("xreal_air_cam telemetry parse and identify")
 
 	CHECK_FALSE(xreal_air_cam_parse_telemetry(raw.data(), XREAL_AIR_CAM_TELEMETRY_OFFSET + 10, &t));
 
-	// Byte 58 wins when it holds a known value.
-	t.id_byte58 = 0x20;
-	t.id_byte59 = 0;
-	CHECK(xreal_air_cam_identify(&t) == XREAL_AIR_CAM_RIGHT);
+	// Byte 59 (0x3b) decides, byte 58 (always 0 live) is ignored.
 	t.id_byte58 = 0x21;
 	t.id_byte59 = 1;
+	CHECK(xreal_air_cam_identify(&t) == XREAL_AIR_CAM_RIGHT);
+	t.id_byte58 = 0x20;
+	t.id_byte59 = 0;
 	CHECK(xreal_air_cam_identify(&t) == XREAL_AIR_CAM_LEFT);
-
-	// Otherwise byte 59 (0x3b) decides.
 	t.id_byte58 = 0;
 	t.id_byte59 = 1;
 	CHECK(xreal_air_cam_identify(&t) == XREAL_AIR_CAM_RIGHT);

@@ -58,12 +58,6 @@ xreal_air_cam_parse_telemetry(const uint8_t *raw, size_t size, struct xreal_air_
 enum xreal_air_cam_id
 xreal_air_cam_identify(const struct xreal_air_cam_telemetry *t)
 {
-	switch (t->id_byte58) {
-	case 0x20: return XREAL_AIR_CAM_RIGHT;
-	case 0x21: return XREAL_AIR_CAM_LEFT;
-	default: break;
-	}
-
 	return t->id_byte59 != 0 ? XREAL_AIR_CAM_RIGHT : XREAL_AIR_CAM_LEFT;
 }
 
@@ -120,14 +114,15 @@ orient_span(
     const uint8_t *src, size_t len, uint32_t r, uint32_t c0, enum xreal_air_cam_id cam, uint8_t *out, size_t stride)
 {
 	if (cam == XREAL_AIR_CAM_RIGHT) {
-		// (x, y) = (r, c)
-		uint8_t *dst = out + (size_t)c0 * stride + r;
+		// (x, y) = (479 - r, c)
+		const uint32_t x = (XREAL_AIR_CAM_READOUT_LINES - 1) - r;
+		uint8_t *dst = out + (size_t)c0 * stride + x;
 		for (size_t k = 0; k < len; k++) {
 			dst[k * stride] = src[k];
 		}
 	} else {
-		// (x, y) = (479 - r, 639 - c)
-		const uint32_t x = (XREAL_AIR_CAM_READOUT_LINES - 1) - r;
+		// (x, y) = (r, 639 - c)
+		const uint32_t x = r;
 		uint8_t *dst = out + (size_t)((XREAL_AIR_CAM_READOUT_LINE - 1) - c0) * stride + x;
 		for (size_t k = 0; k < len; k++) {
 			*(dst - (ptrdiff_t)(k * stride)) = src[k];
