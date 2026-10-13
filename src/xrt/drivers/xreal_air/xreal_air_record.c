@@ -23,6 +23,32 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#ifdef XREAL_AIR_HAVE_ZLIB
+#include <zlib.h>
+
+/*!
+ * zlib at its fastest level for stb's PNG deflate: ~3x faster than stb's own deflate and smaller
+ * files, which is what keeps a single writer thread ahead of 60 images a second.
+ */
+static unsigned char *
+zlib_compress_fast(unsigned char *data, int data_len, int *out_len, int quality)
+{
+	(void)quality;
+	uLongf len = compressBound((uLong)data_len);
+	unsigned char *out = malloc(len);
+	if (out == NULL) {
+		return NULL;
+	}
+	if (compress2(out, &len, data, (uLong)data_len, Z_BEST_SPEED) != Z_OK) {
+		free(out);
+		return NULL;
+	}
+	*out_len = (int)len;
+	return out;
+}
+#define STBIW_ZLIB_COMPRESS zlib_compress_fast
+#endif
+
 // Compile a private copy, so this never clashes with the GUI's (gui_stb.c).
 #define STB_IMAGE_WRITE_STATIC
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -32,8 +58,8 @@
 #define REC_WARN(r, ...) U_LOG_IFL_W((r)->log_level, "Xreal Air record: " __VA_ARGS__)
 #define REC_ERROR(r, ...) U_LOG_IFL_E((r)->log_level, "Xreal Air record: " __VA_ARGS__)
 
-//! Drop new stereo pairs beyond this many queued (two seconds), the disk is not keeping up.
-#define MAX_QUEUED_PAIRS 60
+//! Drop new stereo pairs beyond this many queued (four seconds), the disk is not keeping up.
+#define MAX_QUEUED_PAIRS 120
 //! Raw scrambled frames kept for offline decoder debugging.
 #define MAX_RAW_FRAMES 16
 //! Re-write the calibration files once this many IMU samples gave a rate estimate.
@@ -790,6 +816,8 @@ xreal_air_record_create(const char *dir, enum u_logging_level log_level)
 
 	// Fast PNGs, the disk has to keep up with 60 images a second.
 	stbi_write_png_compression_level = 2;
+	// Skip the per row filter search, the "Sub" filter alone is as small and much faster.
+	stbi_write_force_png_filter = 1;
 
 	if (os_thread_helper_init(&r->oth) != 0) {
 		free(r);
