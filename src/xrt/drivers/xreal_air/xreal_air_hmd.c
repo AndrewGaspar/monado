@@ -56,6 +56,17 @@
 DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_angular_velocity, "XREAL_AIR_ANGULAR_VELOCITY", true)
 DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_scanout_comp, "XREAL_AIR_SCANOUT_COMP", true)
 
+/*
+ * Yaw drift: the fusion only corrects pitch/roll from gravity, so any gyro bias the factory
+ * calibration missed (it walks with temperature) integrates into yaw.
+ *  - XREAL_AIR_AUTO_GYRO_BIAS=false     -> do not re-estimate the gyro bias while still
+ *    (M_IMU_3DOF_AUTO_GYRO_BIAS), fusion is then bit-identical to before.
+ *  - XREAL_AIR_GYRO_BIAS_PARAMS=k=v,..  -> override the estimator tunables, keys are the fields
+ *    of struct m_imu_3dof_gyro_bias_params (also live-tunable via XRT_DEBUG_GUI=1).
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_auto_gyro_bias, "XREAL_AIR_AUTO_GYRO_BIAS", true)
+DEBUG_GET_ONCE_OPTION(xreal_air_gyro_bias_params, "XREAL_AIR_GYRO_BIAS_PARAMS", NULL)
+
 /*!
  * Private struct for the xreal_air device.
  *
@@ -136,6 +147,9 @@ struct xreal_air_hmd
 
 	struct m_imu_3dof fusion;
 	struct m_relation_history *relation_hist;
+
+	//! Arm the fusion's gyro bias estimator once the factory calibration is in.
+	bool gyro_bias_arm_on_calibration;
 };
 
 /*
@@ -586,6 +600,11 @@ handle_sensor_control_cal_data_get_next_segment(struct xreal_air_hmd *hmd,
 		}
 
 		hmd->calibration_valid = true;
+
+		// Samples before this were not factory-calibrated, only learn a bias from here on.
+		if (hmd->gyro_bias_arm_on_calibration) {
+			hmd->fusion.bias_est.params.enabled = true;
+		}
 
 		// Switch to imu sensor data stream (0x01 = enable). On the Air 2 Ultra the stream also
 		// starts via the 0xAA path in the read thread, but sending the explicit enable here matches
@@ -1465,8 +1484,27 @@ xreal_air_hmd_create_device(struct os_hid_device *sensor_device,
 	// Distortion information, fills in xdev->compute_distortion().
 	u_distortion_mesh_set_none(&hmd->base);
 
-	m_imu_3dof_init(&hmd->fusion, M_IMU_3DOF_USE_GRAVITY_DUR_20MS);
+	int fusion_flags = M_IMU_3DOF_USE_GRAVITY_DUR_20MS;
+	if (debug_get_bool_option_xreal_air_auto_gyro_bias()) {
+		fusion_flags |= M_IMU_3DOF_AUTO_GYRO_BIAS;
+	}
+	m_imu_3dof_init(&hmd->fusion, fusion_flags);
 	m_relation_history_create(&hmd->relation_hist);
+
+	char bias_params[512] = "off";
+	if ((fusion_flags & M_IMU_3DOF_AUTO_GYRO_BIAS) != 0) {
+		const char *params = debug_get_option_xreal_air_gyro_bias_params();
+		if (params != NULL && !m_imu_3dof_gyro_bias_params_parse(&hmd->fusion.bias_est.params, params)) {
+			XREAL_AIR_ERROR(hmd, "Could not fully parse XREAL_AIR_GYRO_BIAS_PARAMS='%s'", params);
+		}
+		m_imu_3dof_gyro_bias_params_print(&hmd->fusion.bias_est.params, bias_params, sizeof(bias_params));
+
+		// Samples are not factory-calibrated until the calibration blob is in, so hold the
+		// estimator off until then (see the calibration handler).
+		hmd->gyro_bias_arm_on_calibration = hmd->fusion.bias_est.params.enabled;
+		hmd->fusion.bias_est.params.enabled = false;
+	}
+	XREAL_AIR_DEBUG(hmd, "Auto gyro bias: %s", bias_params);
 
 	hmd->static_id = 0;
 	hmd->display_on = false;
