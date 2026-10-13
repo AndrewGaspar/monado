@@ -370,7 +370,7 @@ xreal_air_camera_create(const char *path,
 		goto error;
 	}
 
-	CAM_INFO(cam, "Streaming from %s", cam->path);
+	CAM_LOG(cam, U_LOGGING_WARN, "Xreal Air camera: Streaming from %s", cam->path);
 	return cam;
 
 error:

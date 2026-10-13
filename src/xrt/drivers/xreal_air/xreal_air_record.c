@@ -475,9 +475,13 @@ static const char readme[] =
     "  imu0/data.csv  Gyro rad/s, accel m/s^2, factory calibrated, in the factory IMU frame\n"
     "                 (x right, y down, z forward) that imu_p_cam / imu_q_cam refer to.\n"
     "\n"
-    "Timestamps in mav0 are CLOCK_MONOTONIC ns: each stream's own device clock mapped onto\n"
-    "the host clock with a windowed minimum-delay skew tracker (removes USB jitter, leaves a\n"
-    "constant per-stream transport latency, so expect a small constant camera-IMU offset).\n"
+    "Timestamps in mav0 are CLOCK_MONOTONIC ns. The camera telemetry and IMU HID timestamps\n"
+    "count the same device clock, which is mapped onto the host clock with a windowed\n"
+    "minimum-delay skew tracker fed by the IMU (removes USB jitter). Camera frames are timed by\n"
+    "their device time through that same mapping (= camera_frames.csv imu_clock_ns), so camera\n"
+    "and IMU share one timeline. With XREAL_AIR_CAMERA_OWN_CLOCK=1, or until the IMU mapping is\n"
+    "usable, a pair is timed through the camera's own tracker (mapped_ns) instead, which is\n"
+    "~26 ms later (the camera's transport latency).\n"
     "\n"
     "xreal/factory_calibration.json  The verbatim factory calibration document.\n"
     "xreal/calibration_basalt.json   Basalt style, converted from SLAM_camera. camera_type is\n"
@@ -495,7 +499,8 @@ static const char readme[] =
     "  id58, id59      telemetry bytes 58 (always 0 so far) and 59 (the camera id, 1 = right)\n"
     "  pair_ts         telemetry offset 62 (u64), second per-pair timestamp\n"
     "  phase           descrambler phase\n"
-    "  mapped_ns       device_ns mapped via the camera clock tracker\n"
+    "  mapped_ns       device_ns mapped via the camera clock tracker, or kernel_ns - 9 ms when\n"
+    "                  that is not possible (logged once, counted at shutdown)\n"
     "  imu_clock_ns    device_ns mapped via the IMU clock tracker, only meaningful if the\n"
     "                  camera and IMU device clocks share an epoch (compare to mapped_ns)\n"
     "  euroc_ns        timestamp used in mav0, -1 if not recorded (unpaired / not synced)\n"
@@ -567,7 +572,8 @@ write_imu(struct xreal_air_record *r, const struct xreal_air_record_imu *s)
 	              raw->mag_multiplier, raw->mag_divisor, s->gyro.x, s->gyro.y, s->gyro.z, s->accel.x, s->accel.y,
 	              s->accel.z);
 
-	if (s->euroc_ns < 0) {
+	// Never put an invalid timestamp into mav0 (the capture maps or falls back, this is a backstop).
+	if (s->euroc_ns <= 0) {
 		return;
 	}
 
@@ -669,7 +675,7 @@ maybe_write_calibration_locked(struct xreal_air_record *r, bool force)
 		r->imu_rate_hz = (double)(r->imu_written - 1) * 1e9 / (double)(r->imu_last_ns - r->imu_first_ns);
 		r->imu_rate_final = true;
 		r->shared.calib_dirty = true;
-		REC_INFO(r, "Measured IMU rate %.2f Hz", r->imu_rate_hz);
+		REC_WARN(r, "Measured IMU rate %.2f Hz", r->imu_rate_hz);
 	}
 
 	if (!r->shared.calib_valid || !(r->shared.calib_dirty || force)) {
@@ -862,6 +868,12 @@ xreal_air_record_push_stereo(struct xreal_air_record *r,
                              struct xrt_frame *left,
                              struct xrt_frame *right)
 {
+	// Backstop, the capture always hands out mapped (or fallback) times.
+	if (euroc_ns <= 0) {
+		REC_ERROR(r, "Refusing a stereo pair with invalid timestamp %" PRId64, euroc_ns);
+		return;
+	}
+
 	struct item *it = U_TYPED_CALLOC(struct item);
 	it->type = ITEM_STEREO;
 	it->stereo.euroc_ns = euroc_ns;
@@ -908,7 +920,7 @@ xreal_air_record_destroy(struct xreal_air_record **r_ptr)
 	// The writer drains the queue before it exits.
 	os_thread_helper_destroy(&r->oth);
 
-	REC_INFO(r, "Closed '%s': %" PRIu64 " stereo pairs, %" PRIu64 " IMU samples, %" PRIu64 " pairs dropped",
+	REC_WARN(r, "Closed '%s': %" PRIu64 " stereo pairs, %" PRIu64 " IMU samples, %" PRIu64 " pairs dropped",
 	         r->path, r->pairs_written, r->imu_written, r->shared.dropped_pairs);
 
 	for (int i = 0; i < 2; i++) {

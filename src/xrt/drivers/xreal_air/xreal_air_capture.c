@@ -33,8 +33,19 @@
 DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_cameras, "XREAL_AIR_CAMERAS", false)
 DEBUG_GET_ONCE_OPTION(xreal_air_euroc_record, "XREAL_AIR_EUROC_RECORD", NULL)
 DEBUG_GET_ONCE_OPTION(xreal_air_camera_device, "XREAL_AIR_CAMERA_DEVICE", NULL)
+/*
+ * The camera telemetry and the IMU HID timestamps count the same device clock: on a 3 minute
+ * recording both drift identically against the host (-51 ppm) and their epochs agree to within
+ * the camera's transport latency (~26 ms). So by default camera frames are timed by mapping their
+ * device time through the IMU's clock tracker, which puts them on exactly the IMU's timeline.
+ * XREAL_AIR_CAMERA_OWN_CLOCK=1 maps them through their own tracker instead (each stream then
+ * carries its own transport latency, ~26 ms apart).
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_camera_own_clock, "XREAL_AIR_CAMERA_OWN_CLOCK", false)
 
 #define CAP_INFO(c, ...) U_LOG_IFL_I((c)->log_level, "Xreal Air capture: " __VA_ARGS__)
+// One-shot lifecycle / diagnostics lines, at WARN so they show at the driver's default log level.
+#define CAP_NOTE(c, ...) U_LOG_IFL_W((c)->log_level, "Xreal Air capture: " __VA_ARGS__)
 #define CAP_WARN(c, ...) U_LOG_IFL_W((c)->log_level, "Xreal Air capture: " __VA_ARGS__)
 #define CAP_ERROR(c, ...) U_LOG_IFL_E((c)->log_level, "Xreal Air capture: " __VA_ARGS__)
 
@@ -45,6 +56,17 @@ DEBUG_GET_ONCE_OPTION(xreal_air_camera_device, "XREAL_AIR_CAMERA_DEVICE", NULL)
 //! Clock tracker windows: ~1 s of camera frames, ~0.5 s of IMU samples.
 #define CAMERA_CLOCK_WINDOW 64
 #define IMU_CLOCK_WINDOW 512
+
+/*!
+ * A device time mapped onto the host clock is only trusted if it lands at most this long before
+ * (and not after) its host arrival time. Otherwise the arrival time minus a typical transport
+ * latency is used instead, see @ref map_device_time.
+ */
+#define MAX_MAPPED_LATENCY_NS (500 * U_TIME_1MS_IN_NS)
+#define MAX_MAPPED_LEAD_NS (20 * U_TIME_1MS_IN_NS) // The tracker smooths, it can briefly lead.
+//! Measured on the Air 2 Ultra: frames arrive ~8.8 ms after their device time, IMU samples < 1 ms.
+#define CAMERA_FALLBACK_LATENCY_NS (9 * U_TIME_1MS_IN_NS)
+#define IMU_FALLBACK_LATENCY_NS (1 * U_TIME_1MS_IN_NS)
 
 //! When to log the clock diagnostics.
 #define IMU_RATE_CHECK_SAMPLES 2000
@@ -100,8 +122,77 @@ struct xreal_air_capture
 		uint64_t warmup; //!< Pairs with zero exposure, kept out of the dataset.
 		uint64_t imu_samples;
 		int64_t cam_minus_imu_clock_ns; //!< Camera clock minus IMU clock mapping of the same instant.
+		uint64_t cam_fallbacks;         //!< Frames whose device time could not be mapped.
+		uint64_t imu_fallbacks;         //!< IMU samples whose device time could not be mapped.
+		uint64_t pairs_own_clock;       //!< Pairs timed through the camera's own clock mapping.
 	} gui;
 };
+
+
+/*
+ *
+ * Clock mapping.
+ *
+ */
+
+/*!
+ * Map a device timestamp onto CLOCK_MONOTONIC through @p tracker, checking the result against the
+ * host arrival time. On failure (tracker not ready, or a nonsensical result) fall back to the
+ * arrival time minus @p fallback_latency_ns, warn once per stream and count it.
+ *
+ * @return The mapped time, always valid.
+ */
+static int64_t
+map_device_time(struct xreal_air_capture *cap,
+                struct m_clock_windowed_skew_tracker *tracker,
+                const char *stream,
+                int64_t device_ns,
+                int64_t arrival_ns,
+                int64_t fallback_latency_ns,
+                uint64_t *fallbacks)
+{
+	timepoint_ns mapped = 0;
+	if (m_clock_windowed_skew_tracker_to_local(tracker, device_ns, &mapped) &&
+	    mapped <= arrival_ns + MAX_MAPPED_LEAD_NS && arrival_ns - mapped <= MAX_MAPPED_LATENCY_NS) {
+		return mapped;
+	}
+
+	if (*fallbacks == 0) {
+		CAP_NOTE(cap,
+		         "Could not map the %s device time %" PRId64 " (arrival %" PRId64 ", tracker %s %" PRId64
+		         "), falling back to arrival - %.1f ms. Further fallbacks are only counted.",
+		         stream, device_ns, arrival_ns, mapped != 0 ? "gave" : "not ready,", (int64_t)mapped,
+		         (double)fallback_latency_ns / U_TIME_1MS_IN_NS);
+	}
+	(*fallbacks)++;
+
+	return arrival_ns - fallback_latency_ns;
+}
+
+
+/*!
+ * The EuRoC timestamp of a pair from its left frame: the device time through the IMU clock
+ * (see XREAL_AIR_CAMERA_OWN_CLOCK), as long as that is sane against the arrival time, else the
+ * camera's own mapping.
+ */
+static int64_t
+pair_timestamp(struct xreal_air_capture *cap, const struct xreal_air_record_cam_frame *left)
+{
+	const int64_t arrival = left->kernel_ns != 0 ? left->kernel_ns : left->dequeue_ns;
+
+	if (!debug_get_bool_option_xreal_air_camera_own_clock() && left->imu_clock_ns > 0 &&
+	    left->imu_clock_ns <= arrival + MAX_MAPPED_LEAD_NS &&
+	    arrival - left->imu_clock_ns <= MAX_MAPPED_LATENCY_NS) {
+		return left->imu_clock_ns;
+	}
+
+	if (cap->gui.pairs_own_clock++ == 0) {
+		CAP_NOTE(cap, "Timing a stereo pair with the camera's own clock mapping (IMU clock %s)",
+		         debug_get_bool_option_xreal_air_camera_own_clock() ? "disabled by XREAL_AIR_CAMERA_OWN_CLOCK"
+		                                                            : "not usable yet");
+	}
+	return left->mapped_ns;
+}
 
 
 /*
@@ -236,10 +327,9 @@ on_camera_frame(void *user, const struct xreal_air_camera_raw_frame *raw)
 	os_mutex_lock(&cap->lock);
 
 	m_clock_windowed_skew_tracker_push(cap->cam_clock, host_ns, device_ns);
-	timepoint_ns mapped = 0;
-	if (m_clock_windowed_skew_tracker_to_local(cap->cam_clock, device_ns, &mapped)) {
-		info.mapped_ns = mapped;
-	}
+	info.mapped_ns = map_device_time(cap, cap->cam_clock, "camera", device_ns, host_ns, CAMERA_FALLBACK_LATENCY_NS,
+	                                 &cap->gui.cam_fallbacks);
+	// Diagnostic only (meaningful if the camera and IMU device clocks are one), no fallback.
 	timepoint_ns imu_mapped = 0;
 	if (m_clock_windowed_skew_tracker_to_local(cap->imu_clock, device_ns, &imu_mapped)) {
 		info.imu_clock_ns = imu_mapped;
@@ -254,13 +344,13 @@ on_camera_frame(void *user, const struct xreal_air_camera_raw_frame *raw)
 
 	os_mutex_unlock(&cap->lock);
 
-	xf->timestamp = info.mapped_ns >= 0 ? (uint64_t)info.mapped_ns : (uint64_t)host_ns;
+	xf->timestamp = (uint64_t)info.mapped_ns;
 	xf->source_timestamp = info.telemetry.device_ns;
 	xf->source_sequence = info.telemetry.counter;
 
 	cap->gui.frames++;
 	if (cap->gui.frames == CAMERA_CLOCK_CHECK_FRAMES) {
-		CAP_INFO(cap,
+		CAP_NOTE(cap,
 		         "Camera clock minus IMU clock (same instant, both mapped to monotonic): %.3f ms. "
 		         "Small and stable = the camera and IMU device clocks share an epoch.",
 		         (double)cap->gui.cam_minus_imu_clock_ns / U_TIME_1MS_IN_NS);
@@ -282,7 +372,7 @@ on_camera_frame(void *user, const struct xreal_air_camera_raw_frame *raw)
 			infos[other] = &cap->pending[other].info;
 
 			// One timestamp for the pair, the left exposure (they are within microseconds).
-			const int64_t pair_ns = infos[XREAL_AIR_CAM_LEFT]->mapped_ns;
+			const int64_t pair_ns = pair_timestamp(cap, infos[XREAL_AIR_CAM_LEFT]);
 
 			// Auto exposure starts from zero after STREAMON, the first pairs are black.
 			const bool warmup = infos[0]->telemetry.exposure == 0 || infos[1]->telemetry.exposure == 0;
@@ -431,6 +521,8 @@ xreal_air_capture_create(enum u_logging_level log_level)
 	u_var_add_ro_u64(cap, &cap->gui.warmup, "Zero exposure pairs (skipped)");
 	u_var_add_ro_u64(cap, &cap->gui.imu_samples, "IMU samples");
 	u_var_add_ro_i64_ns(cap, &cap->gui.cam_minus_imu_clock_ns, "Camera minus IMU clock");
+	u_var_add_ro_u64(cap, &cap->gui.cam_fallbacks, "Camera timestamp fallbacks");
+	u_var_add_ro_u64(cap, &cap->gui.imu_fallbacks, "IMU timestamp fallbacks");
 	u_var_add_sink_debug(cap, &cap->gui.sinks[XREAL_AIR_CAM_LEFT], "Left (cam0)");
 	u_var_add_sink_debug(cap, &cap->gui.sinks[XREAL_AIR_CAM_RIGHT], "Right (cam1)");
 
@@ -500,10 +592,10 @@ xreal_air_capture_push_imu(struct xreal_air_capture *cap,
 	os_mutex_lock(&cap->lock);
 
 	m_clock_windowed_skew_tracker_push(cap->imu_clock, host_ns, (timepoint_ns)device_ts);
-	timepoint_ns mapped = 0;
 	// Samples before the factory calibration arrived are not calibrated, keep them out of mav0.
-	if (cap->calib_valid &&
-	    m_clock_windowed_skew_tracker_to_local(cap->imu_clock, (timepoint_ns)device_ts, &mapped)) {
+	if (cap->calib_valid) {
+		int64_t mapped = map_device_time(cap, cap->imu_clock, "IMU", (int64_t)device_ts, host_ns,
+		                                 IMU_FALLBACK_LATENCY_NS, &cap->gui.imu_fallbacks);
 		// EuRoC wants strictly increasing timestamps.
 		if (mapped <= cap->last_imu_euroc_ns) {
 			mapped = cap->last_imu_euroc_ns + 1;
@@ -529,7 +621,7 @@ xreal_air_capture_push_imu(struct xreal_air_capture *cap,
 			CAP_ERROR(cap, "IMU device timestamps run at %.6f x host time, they are NOT nanoseconds",
 			          ratio);
 		} else {
-			CAP_INFO(cap, "IMU device clock / host clock = %.6f, %.1f Hz", ratio,
+			CAP_NOTE(cap, "IMU device clock / host clock = %.6f, %.1f Hz", ratio,
 			         (double)IMU_RATE_CHECK_SAMPLES * 1e9 / host_span);
 		}
 	}
@@ -553,10 +645,14 @@ xreal_air_capture_destroy(struct xreal_air_capture **cap_ptr)
 	os_thread_helper_destroy(&cap->oth);
 	xreal_air_camera_destroy(&cap->camera);
 
-	CAP_INFO(cap,
+	CAP_NOTE(cap,
 	         "%" PRIu64 " camera frames, %" PRIu64 " pairs, %" PRIu64 " unpaired, %" PRIu64
-	         " zero exposure pairs skipped, %" PRIu64 " IMU samples",
-	         cap->gui.frames, cap->gui.pairs, cap->gui.unpaired, cap->gui.warmup, cap->gui.imu_samples);
+	         " zero exposure pairs skipped, %" PRIu64 " IMU samples, unmappable timestamps: %" PRIu64
+	         " camera / %" PRIu64 " IMU",
+	         cap->gui.frames, cap->gui.pairs, cap->gui.unpaired, cap->gui.warmup, cap->gui.imu_samples,
+	         cap->gui.cam_fallbacks, cap->gui.imu_fallbacks);
+	CAP_NOTE(cap, "%" PRIu64 " pairs timed via the camera's own clock instead of the IMU clock",
+	         cap->gui.pairs_own_clock);
 
 	for (int i = 0; i < 2; i++) {
 		xrt_frame_reference(&cap->pending[i].frame, NULL);
