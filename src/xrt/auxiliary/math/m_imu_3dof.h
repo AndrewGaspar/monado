@@ -94,6 +94,36 @@ struct m_imu_3dof_gyro_bias_params
 	float max_slew_deg_s2;
 	//! Maximum distance of the estimate from the bias at init (deg/s).
 	float max_dev_deg_s;
+
+	//! Seeding from a saved estimate: uncertainty never starts below this (deg/s) ...
+	float seed_min_sd_deg_s;
+	//! ... and grows by this per degree C the device is away from the saved temperature (deg/s per C).
+	float seed_temp_coeff_deg_s_c;
+};
+
+//! Current version of the text format of @ref m_imu_3dof_gyro_bias_record.
+#define M_IMU_3DOF_GYRO_BIAS_RECORD_VERSION 1
+
+/*!
+ * A learned gyro bias worth keeping across sessions, see @ref m_imu_3dof_gyro_bias_record_format,
+ * @ref m_imu_3dof_gyro_bias_record_parse and @ref m_imu_3dof_gyro_bias_seed.
+ *
+ * The bias is what @ref m_imu_3dof::gyro_bias holds: a residual on top of whatever calibration the
+ * samples fed to the fusion already had.
+ */
+struct m_imu_3dof_gyro_bias_record
+{
+	//! Stable id of the device the bias belongs to (e.g. its serial number).
+	char device[64];
+	struct xrt_vec3 bias_deg_s;
+	//! Uncertainty of each component at save time (deg/s).
+	float sd_deg_s;
+	//! Device temperature at save time (C), NAN if unknown.
+	float temp_c;
+	//! Wall clock time of the save (s since the Unix epoch).
+	int64_t saved_unix_s;
+	//! Total still time the estimate was learned from, over all sessions (s).
+	double learned_s;
 };
 
 enum m_imu_3dof_state
@@ -179,6 +209,9 @@ struct m_imu_3dof
 		//! Total learned block time (s).
 		double learned_s;
 
+		//! Started from @ref m_imu_3dof_gyro_bias_seed.
+		bool seeded;
+
 		// Debug output.
 		struct xrt_vec3 last_block_rate; //!< Bias-corrected mean of the last block.
 		float spread_deg_s;              //!< Per-axis scatter of the held blocks.
@@ -214,6 +247,59 @@ m_imu_3dof_gyro_bias_params_parse(struct m_imu_3dof_gyro_bias_params *p, const c
  */
 void
 m_imu_3dof_gyro_bias_params_print(const struct m_imu_3dof_gyro_bias_params *p, char *buf, size_t size);
+
+/*!
+ * Write @p rec as a small human readable text file body.
+ *
+ * @return snprintf-style length.
+ */
+int
+m_imu_3dof_gyro_bias_record_format(const struct m_imu_3dof_gyro_bias_record *rec, char *buf, size_t size);
+
+/*!
+ * Parse and validate a text written by @ref m_imu_3dof_gyro_bias_record_format: right version, all
+ * values present and finite, the bias within @ref m_imu_3dof_gyro_bias_params::max_dev_deg_s (what the
+ * estimator could have learned) and a positive uncertainty.
+ *
+ * @param[out] err Short reason on failure, may be NULL.
+ * @return false on anything unexpected, @p out is then undefined.
+ */
+bool
+m_imu_3dof_gyro_bias_record_parse(const char *str,
+                                  const struct m_imu_3dof_gyro_bias_params *p,
+                                  struct m_imu_3dof_gyro_bias_record *out,
+                                  char *err,
+                                  size_t err_size);
+
+/*!
+ * Uncertainty (deg/s) to seed a saved @p rec with: its saved uncertainty grown by the bias random
+ * walk over the time since the save and by @ref m_imu_3dof_gyro_bias_params::seed_temp_coeff_deg_s_c
+ * per degree of temperature change (skipped if @p temp_c or the saved one is NAN), at least
+ * @ref m_imu_3dof_gyro_bias_params::seed_min_sd_deg_s and at most the prior @ref
+ * m_imu_3dof_gyro_bias_params::init_sd_deg_s (a stale save is still a better guess than none).
+ */
+float
+m_imu_3dof_gyro_bias_record_seed_sd(const struct m_imu_3dof_gyro_bias_record *rec,
+                                    const struct m_imu_3dof_gyro_bias_params *p,
+                                    int64_t now_unix_s,
+                                    float temp_c);
+
+/*!
+ * Start the estimator from a known bias (rad/s) with the given uncertainty (deg/s) instead of
+ * from @ref m_imu_3dof::gyro_bias with @ref m_imu_3dof_gyro_bias_params::init_sd_deg_s. The bias is
+ * used for correction right away; still blocks keep refining it as usual. Clamped to the deviation
+ * limit. Only has an effect with @ref M_IMU_3DOF_AUTO_GYRO_BIAS.
+ */
+void
+m_imu_3dof_gyro_bias_seed(struct m_imu_3dof *f, const struct xrt_vec3 *bias_rad_s, float sd_deg_s);
+
+/*!
+ * Fill in the bias, current uncertainty (grown by the random walk since the last learned block)
+ * and @ref m_imu_3dof::bias_est learned time of @p f. Leaves the device, temperature and time
+ * fields alone.
+ */
+void
+m_imu_3dof_gyro_bias_get_record(const struct m_imu_3dof *f, struct m_imu_3dof_gyro_bias_record *out);
 
 void
 m_imu_3dof_init(struct m_imu_3dof *f, int flags);
