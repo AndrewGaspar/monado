@@ -67,7 +67,7 @@ TEST_CASE("xreal_air_cam_descramble recovers the readout at any phase")
 
 		std::vector<uint8_t> out(XREAL_AIR_CAM_IMAGE_SIZE, 0);
 		CHECK(xreal_air_cam_descramble(raw.data(), out.data()) == phase);
-		CHECK(out == readout);
+		CHECK((out == readout)); // parenthesised: Catch2 must not stringify a 300 KB frame
 	}
 
 	std::uniform_int_distribution<uint32_t> phase_dist(0, XREAL_AIR_CAM_CHUNK_COUNT - 1);
@@ -79,7 +79,7 @@ TEST_CASE("xreal_air_cam_descramble recovers the readout at any phase")
 
 		std::vector<uint8_t> out(XREAL_AIR_CAM_IMAGE_SIZE, 0);
 		CHECK(xreal_air_cam_descramble(raw.data(), out.data()) == phase);
-		CHECK(out == readout);
+		CHECK((out == readout));
 	}
 }
 
@@ -121,7 +121,7 @@ TEST_CASE("xreal_air_cam_decode equals descramble + orient, with padded stride")
 
 		xreal_air_cam_orient(readout.data(), cam, expected.data(), stride);
 		CHECK(xreal_air_cam_decode(raw.data(), cam, actual.data(), stride) == phase);
-		CHECK(actual == expected);
+		CHECK((actual == expected));
 
 		// The stride padding is untouched.
 		for (size_t y = 0; y < XREAL_AIR_CAM_HEIGHT; y += 50) {
