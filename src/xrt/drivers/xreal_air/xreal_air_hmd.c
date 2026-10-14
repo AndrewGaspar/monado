@@ -23,6 +23,7 @@
 #include "util/u_var.h"
 
 #include "xreal_air_hmd.h"
+#include "xreal_air_gyro_bias_store.h"
 #include "xreal_air_imu_dump.h"
 
 #include "math/m_mathinclude.h"
@@ -64,11 +65,15 @@ DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_scanout_comp, "XREAL_AIR_SCANOUT_COMP", tru
  *    (M_IMU_3DOF_AUTO_GYRO_BIAS), fusion is then bit-identical to before.
  *  - XREAL_AIR_GYRO_BIAS_PARAMS=k=v,..  -> override the estimator tunables, keys are the fields
  *    of struct m_imu_3dof_gyro_bias_params (also live-tunable via XRT_DEBUG_GUI=1).
+ *  - XREAL_AIR_GYRO_BIAS_PERSIST=false -> neither load nor save the learned bias, which otherwise
+ *    lives per glasses serial in $XDG_STATE_HOME/monado/ (~/.local/state/monado/) and seeds the
+ *    estimator at startup (see xreal_air_gyro_bias_store.c).
  *  - XREAL_AIR_IMU_DUMP=/path.csv|/dir  -> write every fused IMU sample to a CSV (a directory gets
  *    a timestamped file) for offline replay with `monado-cli imu-replay`.
  */
 DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_auto_gyro_bias, "XREAL_AIR_AUTO_GYRO_BIAS", true)
 DEBUG_GET_ONCE_OPTION(xreal_air_gyro_bias_params, "XREAL_AIR_GYRO_BIAS_PARAMS", NULL)
+DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_gyro_bias_persist, "XREAL_AIR_GYRO_BIAS_PERSIST", true)
 DEBUG_GET_ONCE_OPTION(xreal_air_imu_dump, "XREAL_AIR_IMU_DUMP", NULL)
 
 /*!
@@ -157,6 +162,13 @@ struct xreal_air_hmd
 
 	//! Optional raw IMU dump, only touched from the sensor thread (and create/destroy).
 	struct xreal_air_imu_dump *imu_dump;
+
+	//! Optional learned gyro bias persistence, only touched from the sensor thread (and create/destroy).
+	struct xreal_air_gyro_bias_store *gyro_bias_store;
+	//! Seed the estimator from @ref gyro_bias_store with the first factory-calibrated sample.
+	bool gyro_bias_seed_pending;
+	//! The factory calibration parsed, so the learned bias is a residual on top of it and worth keeping.
+	bool gyro_bias_persist_ok;
 };
 
 /*
@@ -372,7 +384,14 @@ update_fusion(struct xreal_air_hmd *hmd,
 	                                                     XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT);
 
 	os_mutex_lock(&hmd->device_mutex);
+	if (hmd->gyro_bias_seed_pending && hmd->gyro_bias_persist_ok) {
+		hmd->gyro_bias_seed_pending = false;
+		xreal_air_gyro_bias_store_seed(hmd->gyro_bias_store, &hmd->fusion, hmd->read.temperature);
+	}
 	update_fusion_locked(hmd, sample, timestamp_ns);
+	if (hmd->gyro_bias_persist_ok) {
+		xreal_air_gyro_bias_store_tick(hmd->gyro_bias_store, &hmd->fusion, hmd->read.temperature, host_ns);
+	}
 	rel.pose.orientation = hmd->fusion.rot; // We have no tracking, don't return a position.
 	struct xrt_vec3 gyro = hmd->read.gyro;  // Calibrated body-space angular rate (rad/s).
 
@@ -608,6 +627,10 @@ handle_sensor_control_cal_data_get_next_segment(struct xreal_air_hmd *hmd,
 			// (which otherwise floods the log and hammers the HID bus indefinitely).
 			XREAL_AIR_ERROR(hmd, "Failed to parse factory calibration — using default IMU calibration");
 		} else {
+			// Only a residual on top of the real factory calibration is worth keeping, one on top
+			// of the defaults would be garbage next time.
+			hmd->gyro_bias_persist_ok = hmd->gyro_bias_store != NULL;
+
 			XREAL_AIR_DEBUG(hmd,
 			                "Factory calibration parsed: gyro_bias=[%.5f %.5f %.5f] accel_bias=[%.5f %.5f %.5f]",
 			                hmd->calibration.gyro_bias.x, hmd->calibration.gyro_bias.y,
@@ -1279,6 +1302,8 @@ teardown(struct xreal_air_hmd *hmd)
 
 	// Nothing pushes any more, flush the rest.
 	xreal_air_imu_dump_destroy(&hmd->imu_dump);
+	xreal_air_gyro_bias_store_destroy(&hmd->gyro_bias_store, hmd->gyro_bias_persist_ok ? &hmd->fusion : NULL,
+	                                  hmd->read.temperature);
 
 	if (hmd->hid_control != NULL) {
 		os_hid_destroy(hmd->hid_control);
@@ -1491,7 +1516,8 @@ struct xrt_device *
 xreal_air_hmd_create_device(struct os_hid_device *sensor_device,
                             struct os_hid_device *control_device,
                             enum u_logging_level log_level,
-                            uint16_t max_sensor_buffer_size)
+                            uint16_t max_sensor_buffer_size,
+                            const char *serial)
 {
 	enum u_device_alloc_flags flags =
 	    (enum u_device_alloc_flags)(U_DEVICE_ALLOC_HMD | U_DEVICE_ALLOC_TRACKING_NONE);
@@ -1545,6 +1571,13 @@ xreal_air_hmd_create_device(struct os_hid_device *sensor_device,
 		// estimator off until then (see the calibration handler).
 		hmd->gyro_bias_arm_on_calibration = hmd->fusion.bias_est.params.enabled;
 		hmd->fusion.bias_est.params.enabled = false;
+
+		if (hmd->gyro_bias_arm_on_calibration && debug_get_bool_option_xreal_air_gyro_bias_persist()) {
+			hmd->gyro_bias_store =
+			    xreal_air_gyro_bias_store_create(serial != NULL && serial[0] != '\0' ? serial : "unknown",
+			                                     &hmd->fusion.bias_est.params, hmd->log_level);
+			hmd->gyro_bias_seed_pending = hmd->gyro_bias_store != NULL;
+		}
 	}
 	XREAL_AIR_DEBUG(hmd, "Auto gyro bias: %s", bias_params);
 

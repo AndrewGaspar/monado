@@ -48,6 +48,9 @@ endif()
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	list(APPEND tests tests_levenbergmarquardt)
 endif()
+if(XRT_BUILD_DRIVER_XREAL_AIR)
+	list(APPEND tests tests_xreal_air_gyro_bias_store)
+endif()
 
 foreach(testname ${tests})
 	add_executable(${testname} ${testname}.cpp)
@@ -72,6 +75,13 @@ target_link_libraries(tests_pose PRIVATE aux_math)
 target_link_libraries(tests_quat_change_of_basis PRIVATE aux_math)
 target_link_libraries(tests_quat_swing_twist PRIVATE aux_math)
 target_link_libraries(tests_vec3_angle PRIVATE aux_math)
+
+if(XRT_BUILD_DRIVER_XREAL_AIR)
+	target_link_libraries(tests_xreal_air_gyro_bias_store PRIVATE drv_xreal_air aux_math aux_os)
+	target_include_directories(
+		tests_xreal_air_gyro_bias_store PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers
+		)
+endif()
 
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	target_link_libraries(

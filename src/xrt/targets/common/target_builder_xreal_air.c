@@ -195,7 +195,8 @@ xreal_air_open_system_impl(struct xrt_builder *xb,
 	}
 
 	struct xrt_device *xreal_air_device = xreal_air_hmd_create_device(
-	    hid_handle, hid_control, xreal_air_log_level, driver_max_sensor_buffer_sizes[product_index]);
+	    hid_handle, hid_control, xreal_air_log_level, driver_max_sensor_buffer_sizes[product_index],
+	    result < 0 ? NULL : (const char *)hmd_serial_no);
 
 	if (xreal_air_device == NULL) {
 		XREAL_AIR_ERROR("Failed to initialise Xreal Air driver");
