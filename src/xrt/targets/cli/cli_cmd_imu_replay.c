@@ -8,7 +8,8 @@
  * the samples through two fresh fusions: (a) static factory calibration only and
  * (b) with M_IMU_3DOF_AUTO_GYRO_BIAS and the given tunables. Prints yaw versus
  * time for both (plus the yaw recorded live) as CSV and a drift summary, which
- * is what the estimator tunables get tuned against.
+ * is what the estimator tunables get tuned against. With --seed-bias a third
+ * fusion starts the estimator from a saved bias, as the driver does at startup.
  */
 
 #include "math/m_api.h"
@@ -34,12 +35,17 @@ print_usage(const char *argv0)
 	P("Replays an XREAL_AIR_IMU_DUMP capture through m_imu_3dof twice: static factory\n");
 	P("calibration only, and with automatic gyro bias estimation. Writes CSV to stdout:\n");
 	P("  t_s,temp_c,yaw_static_deg,yaw_est_deg,yaw_live_deg,bias_x,bias_y,bias_z (deg/s),still\n");
+	P("  [,yaw_seeded_deg,seeded_bias_x,seeded_bias_y,seeded_bias_z with --seed-bias]\n");
 	P("and a drift summary to stderr.\n");
 	P("\n");
 	P("Options:\n");
 	P("  --params k=v,...  estimator tunables (struct m_imu_3dof_gyro_bias_params field names)\n");
 	P("  --every N         output every Nth sample (default 100, 10 Hz at 1 kHz)\n");
 	P("  --tail S          also fit drift over the last S seconds (default 300)\n");
+	P("  --head S          also report the yaw change over the first S seconds (default 100)\n");
+	P("  --seed-bias x,y,z also replay with the estimator seeded from this bias (deg/s), like\n");
+	P("                    the driver does from the saved one at startup\n");
+	P("  --seed-sd S       uncertainty of the seed (deg/s, default seed_min_sd_deg_s)\n");
 	P("  --device-clock    feed the fusion device timestamps instead of the host-anchored ones\n");
 	P("                    the live fusion saw (shows what USB/scheduling jitter costs)\n");
 	P("  --quiet           summary only, no CSV\n");
@@ -137,10 +143,11 @@ enum track
 	TRACK_STATIC = 0,
 	TRACK_EST = 1,
 	TRACK_LIVE = 2,
-	TRACK_COUNT = 3,
+	TRACK_SEEDED = 3,
+	TRACK_COUNT = 4,
 };
 
-static const char *track_names[TRACK_COUNT] = {"static-cal only", "bias estimator", "recorded live"};
+static const char *track_names[TRACK_COUNT] = {"static-cal only", "bias estimator", "recorded live", "seeded est."};
 
 int
 cli_cmd_imu_replay(int argc, const char **argv)
@@ -151,6 +158,10 @@ cli_cmd_imu_replay(int argc, const char **argv)
 	double tail_s = 300.0;
 	bool quiet = false;
 	bool device_clock = false;
+	double head_s = 100.0;
+	bool seed = false;
+	struct xrt_vec3 seed_bias_deg_s = XRT_VEC3_ZERO;
+	double seed_sd_deg_s = -1.0;
 
 	for (int i = 2; i < argc; i++) {
 		if (strcmp(argv[i], "--params") == 0 && i + 1 < argc) {
@@ -159,6 +170,17 @@ cli_cmd_imu_replay(int argc, const char **argv)
 			every = strtol(argv[++i], NULL, 10);
 		} else if (strcmp(argv[i], "--tail") == 0 && i + 1 < argc) {
 			tail_s = strtod(argv[++i], NULL);
+		} else if (strcmp(argv[i], "--head") == 0 && i + 1 < argc) {
+			head_s = strtod(argv[++i], NULL);
+		} else if (strcmp(argv[i], "--seed-bias") == 0 && i + 1 < argc) {
+			struct xrt_vec3 *b = &seed_bias_deg_s;
+			if (sscanf(argv[++i], "%f,%f,%f", &b->x, &b->y, &b->z) != 3) {
+				P("Bad --seed-bias '%s', want x,y,z in deg/s\n", argv[i]);
+				return 1;
+			}
+			seed = true;
+		} else if (strcmp(argv[i], "--seed-sd") == 0 && i + 1 < argc) {
+			seed_sd_deg_s = strtod(argv[++i], NULL);
 		} else if (strcmp(argv[i], "--device-clock") == 0) {
 			device_clock = true;
 		} else if (strcmp(argv[i], "--quiet") == 0) {
@@ -183,23 +205,43 @@ cli_cmd_imu_replay(int argc, const char **argv)
 
 	struct m_imu_3dof fusion_static;
 	struct m_imu_3dof fusion_est;
+	struct m_imu_3dof fusion_seeded;
 	m_imu_3dof_init(&fusion_static, M_IMU_3DOF_USE_GRAVITY_DUR_20MS);
 	m_imu_3dof_init(&fusion_est, M_IMU_3DOF_USE_GRAVITY_DUR_20MS | M_IMU_3DOF_AUTO_GYRO_BIAS);
+	m_imu_3dof_init(&fusion_seeded, M_IMU_3DOF_USE_GRAVITY_DUR_20MS | M_IMU_3DOF_AUTO_GYRO_BIAS);
 
 	if (params_str != NULL && !m_imu_3dof_gyro_bias_params_parse(&fusion_est.bias_est.params, params_str)) {
 		P("Bad --params '%s'\n", params_str);
 		fclose(file);
 		m_imu_3dof_close(&fusion_static);
 		m_imu_3dof_close(&fusion_est);
+		m_imu_3dof_close(&fusion_seeded);
 		return 1;
 	}
+	fusion_seeded.bias_est.params = fusion_est.bias_est.params;
+
+	if (seed) {
+		if (seed_sd_deg_s <= 0.0) {
+			seed_sd_deg_s = (double)fusion_seeded.bias_est.params.seed_min_sd_deg_s;
+		}
+		struct xrt_vec3 b = {
+		    (float)DEG_TO_RAD((double)seed_bias_deg_s.x),
+		    (float)DEG_TO_RAD((double)seed_bias_deg_s.y),
+		    (float)DEG_TO_RAD((double)seed_bias_deg_s.z),
+		};
+		m_imu_3dof_gyro_bias_seed(&fusion_seeded, &b, (float)seed_sd_deg_s);
+		P("seed:   [%.4f %.4f %.4f] deg/s, sd %.4f deg/s\n", (double)seed_bias_deg_s.x,
+		  (double)seed_bias_deg_s.y, (double)seed_bias_deg_s.z, seed_sd_deg_s);
+	}
+	const int track_count = seed ? TRACK_COUNT : TRACK_SEEDED;
 
 	char params_buf[512];
 	m_imu_3dof_gyro_bias_params_print(&fusion_est.bias_est.params, params_buf, sizeof(params_buf));
 	P("params: %s\n", params_buf);
 
 	if (!quiet) {
-		printf("t_s,temp_c,yaw_static_deg,yaw_est_deg,yaw_live_deg,bias_x,bias_y,bias_z,still\n");
+		printf("t_s,temp_c,yaw_static_deg,yaw_est_deg,yaw_live_deg,bias_x,bias_y,bias_z,still%s\n",
+		       seed ? ",yaw_seeded_deg,seeded_bias_x,seeded_bias_y,seeded_bias_z" : "");
 	}
 
 	struct yaw_track tracks[TRACK_COUNT] = {0};
@@ -226,6 +268,8 @@ cli_cmd_imu_replay(int argc, const char **argv)
 	double max_gap_at_s = 0.0;
 	uint64_t max_gap_index = 0;
 	double first_learn_s = -1.0;
+	double first_learn_seeded_s = -1.0;
+	double yaw_head[TRACK_COUNT] = {0};
 
 	while (fgets(line, sizeof(line), file) != NULL) {
 		if (line[0] == '#') {
@@ -273,6 +317,12 @@ cli_cmd_imu_replay(int argc, const char **argv)
 
 		m_imu_3dof_update(&fusion_static, (uint64_t)s.fusion_ns, &s.accel, &s.gyro);
 		m_imu_3dof_update(&fusion_est, (uint64_t)s.fusion_ns, &s.accel, &s.gyro);
+		if (seed) {
+			m_imu_3dof_update(&fusion_seeded, (uint64_t)s.fusion_ns, &s.accel, &s.gyro);
+			if (first_learn_seeded_s < 0.0 && fusion_seeded.bias_est.commits > 0) {
+				first_learn_seeded_s = (double)(s.fusion_ns - first_ns) / 1e9;
+			}
+		}
 		still_count += fusion_est.bias_est.is_still ? 1 : 0;
 		if (first_learn_s < 0.0 && fusion_est.bias_est.commits > 0) {
 			first_learn_s = (double)(s.fusion_ns - first_ns) / 1e9;
@@ -283,6 +333,7 @@ cli_cmd_imu_replay(int argc, const char **argv)
 		    yaw_track_push(&tracks[TRACK_STATIC], yaw_deg(&fusion_static.rot)),
 		    yaw_track_push(&tracks[TRACK_EST], yaw_deg(&fusion_est.rot)),
 		    yaw_track_push(&tracks[TRACK_LIVE], yaw_deg(&s.rot)),
+		    seed ? yaw_track_push(&tracks[TRACK_SEEDED], yaw_deg(&fusion_seeded.rot)) : 0.0,
 		};
 
 		if (count == 0) {
@@ -291,6 +342,9 @@ cli_cmd_imu_replay(int argc, const char **argv)
 
 		for (int k = 0; k < TRACK_COUNT; k++) {
 			yaw_end[k] = yaw[k] - yaw0[k];
+			if (t <= head_s) {
+				yaw_head[k] = yaw_end[k];
+			}
 		}
 
 		if (count % (uint64_t)every == 0) {
@@ -317,10 +371,16 @@ cli_cmd_imu_replay(int argc, const char **argv)
 
 			if (!quiet) {
 				struct xrt_vec3 b = fusion_est.gyro_bias.value;
-				printf("%.3f,%.2f,%.4f,%.4f,%.4f,%.5f,%.5f,%.5f,%d\n", t, (double)s.temp_c,
+				printf("%.3f,%.2f,%.4f,%.4f,%.4f,%.5f,%.5f,%.5f,%d", t, (double)s.temp_c,
 				       yaw_end[TRACK_STATIC], yaw_end[TRACK_EST], yaw_end[TRACK_LIVE],
 				       RAD_TO_DEG((double)b.x), RAD_TO_DEG((double)b.y), RAD_TO_DEG((double)b.z),
 				       fusion_est.bias_est.is_still ? 1 : 0);
+				if (seed) {
+					struct xrt_vec3 sb = fusion_seeded.gyro_bias.value;
+					printf(",%.4f,%.5f,%.5f,%.5f", yaw_end[TRACK_SEEDED], RAD_TO_DEG((double)sb.x),
+					       RAD_TO_DEG((double)sb.y), RAD_TO_DEG((double)sb.z));
+				}
+				printf("\n");
 			}
 		}
 
@@ -333,6 +393,7 @@ cli_cmd_imu_replay(int argc, const char **argv)
 		free(pts);
 		m_imu_3dof_close(&fusion_static);
 		m_imu_3dof_close(&fusion_est);
+		m_imu_3dof_close(&fusion_seeded);
 		return 1;
 	}
 
@@ -353,18 +414,28 @@ cli_cmd_imu_replay(int argc, const char **argv)
 	P("             first learned at %.1f s, sd %.4f deg/s, rejects: %u sample, %u block, %u yaw-window\n",
 	  first_learn_s, (double)fusion_est.bias_est.sd_deg_s, fusion_est.bias_est.rejects_sample,
 	  fusion_est.bias_est.rejects_block, fusion_est.bias_est.rejects_yaw);
+	if (seed) {
+		struct xrt_vec3 sb = fusion_seeded.gyro_bias.value;
+		P("seeded:      %u blocks learned (%.0f s), final bias [%.4f %.4f %.4f] deg/s, first learned at "
+		  "%.1f s, sd %.4f deg/s\n",
+		  fusion_seeded.bias_est.commits, fusion_seeded.bias_est.learned_s, RAD_TO_DEG((double)sb.x),
+		  RAD_TO_DEG((double)sb.y), RAD_TO_DEG((double)sb.z), first_learn_seeded_s,
+		  (double)fusion_seeded.bias_est.sd_deg_s);
+	}
 	P("\n");
-	P("yaw            | end-start (deg) | fit, whole (deg/min) | fit, last %.0f s (deg/min)\n", tail_s);
+	P("yaw            | first %4.0f s (deg) | end-start (deg) | fit, whole (deg/min) | fit, last %.0f s "
+	  "(deg/min)\n",
+	  head_s, tail_s);
 
-	for (int k = 0; k < TRACK_COUNT; k++) {
+	for (int k = 0; k < track_count; k++) {
 		struct fit tail = {0};
 		for (size_t i = 0; i < pts_len; i++) {
 			if (pts[i][0] >= dur_s - tail_s) {
 				fit_add(&tail, pts[i][0], pts[i][1 + k]);
 			}
 		}
-		P("%-15s| %15.3f | %20.3f | %20.3f\n", track_names[k], yaw_end[k], fit_slope(&fits[k]) * 60.0,
-		  fit_slope(&tail) * 60.0);
+		P("%-15s| %18.3f | %15.3f | %20.3f | %20.3f\n", track_names[k], yaw_head[k], yaw_end[k],
+		  fit_slope(&fits[k]) * 60.0, fit_slope(&tail) * 60.0);
 	}
 	P("\n(Only meaningful for captures where the glasses really did not turn: a worn capture's\n"
 	  " yaw is the head's true yaw plus drift.)\n");
@@ -372,6 +443,7 @@ cli_cmd_imu_replay(int argc, const char **argv)
 	free(pts);
 	m_imu_3dof_close(&fusion_static);
 	m_imu_3dof_close(&fusion_est);
+	m_imu_3dof_close(&fusion_seeded);
 
 	return 0;
 }
