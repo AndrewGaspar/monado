@@ -31,6 +31,7 @@
 #ifdef XRT_OS_LINUX
 #include <sys/stat.h>
 #include <linux/limits.h>
+#include <unistd.h>
 
 static int
 mkpath(const char *path)
@@ -198,7 +199,86 @@ u_file_get_hand_tracking_models_dir(char *out_path, size_t out_path_size)
 	return ret;
 }
 
+int
+u_file_get_state_dir(char *out_path, size_t out_path_size)
+{
+	const char *xdg_state = getenv("XDG_STATE_HOME");
+	const char *home = getenv("HOME");
+	if (xdg_state != NULL && xdg_state[0] == '/') {
+		return snprintf(out_path, out_path_size, "%s/monado", xdg_state);
+	}
+	if (home != NULL) {
+		return snprintf(out_path, out_path_size, "%s/.local/state/monado", home);
+	}
+	return -1;
+}
+
+int
+u_file_get_path_in_state_dir(const char *suffix, char *out_path, size_t out_path_size)
+{
+	char tmp[PATH_MAX];
+	int i = u_file_get_state_dir(tmp, sizeof(tmp));
+	if (i <= 0 || i >= (int)sizeof(tmp)) {
+		return -1;
+	}
+
+	return snprintf(out_path, out_path_size, "%s/%s", tmp, suffix);
+}
+
 #endif /* XRT_OS_LINUX */
+
+int
+u_file_write_atomic(const char *path, const void *data, size_t size)
+{
+	char tmp_path[PATH_MAX + 32];
+	int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+	if (n < 0 || n >= (int)sizeof(tmp_path)) {
+		return -ENAMETOOLONG;
+	}
+
+#ifdef XRT_OS_LINUX
+	// Create the containing directory if needed.
+	char dir[PATH_MAX];
+	snprintf(dir, sizeof(dir), "%s", path);
+	char *slash = strrchr(dir, '/');
+	if (slash != NULL && slash != dir) {
+		*slash = '\0';
+		if (!is_dir(dir) && mkpath(dir) < 0) {
+			return -errno;
+		}
+	}
+#endif
+
+	FILE *file = fopen(tmp_path, "wb");
+	if (file == NULL) {
+		return -errno;
+	}
+
+	bool ok = fwrite(data, 1, size, file) == size;
+	ok = fflush(file) == 0 && ok;
+#ifdef XRT_OS_LINUX
+	ok = fsync(fileno(file)) == 0 && ok;
+#endif
+	int err = errno;
+	ok = fclose(file) == 0 && ok;
+
+	if (!ok) {
+		remove(tmp_path);
+		return -(err != 0 ? err : EIO);
+	}
+
+#ifdef XRT_OS_WINDOWS
+	// rename() does not replace on Windows.
+	remove(path);
+#endif
+	if (rename(tmp_path, path) != 0) {
+		err = errno;
+		remove(tmp_path);
+		return -err;
+	}
+
+	return 0;
+}
 
 int
 u_file_get_runtime_dir(char *out_path, size_t out_path_size)

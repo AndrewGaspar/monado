@@ -196,13 +196,16 @@ struct xreal_air_parsed_control
 /*!
  * Create Xreal Air glasses.
  *
+ * @p serial (USB serial number, may be NULL) keys the saved gyro bias.
+ *
  * @ingroup drv_xreal_air
  */
 struct xrt_device *
 xreal_air_hmd_create_device(struct os_hid_device *sensor_device,
                             struct os_hid_device *control_device,
                             enum u_logging_level log_level,
-                            uint16_t max_sensor_buffer_size);
+                            uint16_t max_sensor_buffer_size,
+                            const char *serial);
 
 void
 xreal_air_calibration_set_defaults(struct xreal_air_parsed_calibration *calibration);

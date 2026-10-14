@@ -18,6 +18,7 @@
 #include "math/m_vec3.h"
 #include "math/m_mathinclude.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,6 +59,8 @@ m_imu_3dof_gyro_bias_params_default(struct m_imu_3dof_gyro_bias_params *p)
 	    .walk_deg_s_sqrt_s = 0.002f,
 	    .max_slew_deg_s2 = 0.1f,
 	    .max_dev_deg_s = 1.0f,
+	    .seed_min_sd_deg_s = 0.03f,
+	    .seed_temp_coeff_deg_s_c = 0.01f,
 	};
 }
 
@@ -76,7 +79,9 @@ m_imu_3dof_gyro_bias_params_default(struct m_imu_3dof_gyro_bias_params *p)
 	X(init_sd_deg_s)                                                                                               \
 	X(walk_deg_s_sqrt_s)                                                                                           \
 	X(max_slew_deg_s2)                                                                                             \
-	X(max_dev_deg_s)
+	X(max_dev_deg_s)                                                                                               \
+	X(seed_min_sd_deg_s)                                                                                           \
+	X(seed_temp_coeff_deg_s_c)
 
 bool
 m_imu_3dof_gyro_bias_params_parse(struct m_imu_3dof_gyro_bias_params *p, const char *str)
@@ -138,6 +143,233 @@ m_imu_3dof_gyro_bias_params_print(const struct m_imu_3dof_gyro_bias_params *p, c
 	BIAS_PARAMS_FLOAT_FIELDS(PRINT_FLOAT)
 
 #undef PRINT_FLOAT
+}
+
+int
+m_imu_3dof_gyro_bias_record_format(const struct m_imu_3dof_gyro_bias_record *rec, char *buf, size_t size)
+{
+	return snprintf(buf, size,
+	                "# Learned gyro bias residual (m_imu_3dof), on top of the device's own calibration.\n"
+	                "version=%d\n"
+	                "device=%s\n"
+	                "bias_deg_s=%.6f %.6f %.6f\n"
+	                "sd_deg_s=%.6f\n"
+	                "temp_c=%.3f\n"
+	                "saved_unix_s=%" PRId64
+	                "\n"
+	                "learned_s=%.1f\n",
+	                M_IMU_3DOF_GYRO_BIAS_RECORD_VERSION, rec->device, (double)rec->bias_deg_s.x,
+	                (double)rec->bias_deg_s.y, (double)rec->bias_deg_s.z, (double)rec->sd_deg_s,
+	                (double)rec->temp_c, rec->saved_unix_s, rec->learned_s);
+}
+
+#define RECORD_FAIL(...)                                                                                               \
+	do {                                                                                                           \
+		if (err != NULL && err_size > 0) {                                                                     \
+			snprintf(err, err_size, __VA_ARGS__);                                                          \
+		}                                                                                                      \
+		return false;                                                                                          \
+	} while (false)
+
+bool
+m_imu_3dof_gyro_bias_record_parse(const char *str,
+                                  const struct m_imu_3dof_gyro_bias_params *p,
+                                  struct m_imu_3dof_gyro_bias_record *out,
+                                  char *err,
+                                  size_t err_size)
+{
+	enum
+	{
+		HAVE_VERSION = 1 << 0,
+		HAVE_DEVICE = 1 << 1,
+		HAVE_BIAS = 1 << 2,
+		HAVE_SD = 1 << 3,
+		HAVE_TEMP = 1 << 4,
+		HAVE_SAVED = 1 << 5,
+		HAVE_LEARNED = 1 << 6,
+		HAVE_ALL = (1 << 7) - 1,
+	};
+	int have = 0;
+	long version = 0;
+
+	U_ZERO(out);
+
+	const char *line = str;
+	while (line != NULL && *line != '\0') {
+		const char *next = strchr(line, '\n');
+		size_t len = next != NULL ? (size_t)(next - line) : strlen(line);
+		char buf[256];
+		if (len >= sizeof(buf)) {
+			RECORD_FAIL("line too long");
+		}
+		memcpy(buf, line, len);
+		buf[len] = '\0';
+		line = next != NULL ? next + 1 : NULL;
+
+		if (buf[0] == '#' || buf[0] == '\0') {
+			continue;
+		}
+
+		char *eq = strchr(buf, '=');
+		if (eq == NULL) {
+			RECORD_FAIL("malformed line '%s'", buf);
+		}
+		*eq = '\0';
+		const char *key = buf;
+		const char *val = eq + 1;
+		char *end = NULL;
+
+		if (strcmp(key, "version") == 0) {
+			version = strtol(val, &end, 10);
+			have |= HAVE_VERSION;
+		} else if (strcmp(key, "device") == 0) {
+			snprintf(out->device, sizeof(out->device), "%s", val);
+			end = (char *)val + strlen(val);
+			have |= HAVE_DEVICE;
+		} else if (strcmp(key, "bias_deg_s") == 0) {
+			double v[3];
+			const char *c = val;
+			for (int i = 0; i < 3; i++) {
+				v[i] = strtod(c, &end);
+				if (end == c || !isfinite(v[i])) {
+					RECORD_FAIL("bad bias '%s'", val);
+				}
+				c = end;
+			}
+			out->bias_deg_s = (struct xrt_vec3){(float)v[0], (float)v[1], (float)v[2]};
+			have |= HAVE_BIAS;
+		} else if (strcmp(key, "sd_deg_s") == 0) {
+			out->sd_deg_s = strtof(val, &end);
+			have |= HAVE_SD;
+		} else if (strcmp(key, "temp_c") == 0) {
+			out->temp_c = strtof(val, &end);
+			have |= HAVE_TEMP;
+		} else if (strcmp(key, "saved_unix_s") == 0) {
+			out->saved_unix_s = strtoll(val, &end, 10);
+			have |= HAVE_SAVED;
+		} else if (strcmp(key, "learned_s") == 0) {
+			out->learned_s = strtod(val, &end);
+			have |= HAVE_LEARNED;
+		} else {
+			RECORD_FAIL("unknown key '%s'", key);
+		}
+
+		if (end == val) {
+			RECORD_FAIL("bad value for '%s'", key);
+		}
+		while (*end == ' ' || *end == '\t' || *end == '\r') {
+			end++;
+		}
+		if (*end != '\0') {
+			RECORD_FAIL("trailing garbage after '%s'", key);
+		}
+	}
+
+	if ((have & HAVE_VERSION) == 0 || version != M_IMU_3DOF_GYRO_BIAS_RECORD_VERSION) {
+		RECORD_FAIL("unsupported version %ld", version);
+	}
+	if (have != HAVE_ALL) {
+		RECORD_FAIL("missing keys");
+	}
+	if (!isfinite(out->sd_deg_s) || out->sd_deg_s <= 0.0f) {
+		RECORD_FAIL("bad sd %g", (double)out->sd_deg_s);
+	}
+	if (!isfinite(out->learned_s) || out->learned_s < 0.0) {
+		RECORD_FAIL("bad learned_s %g", out->learned_s);
+	}
+	if (out->saved_unix_s <= 0) {
+		RECORD_FAIL("bad saved_unix_s %" PRId64, out->saved_unix_s);
+	}
+	// NAN is the "unknown" temperature, inf is not.
+	if (isinf(out->temp_c)) {
+		RECORD_FAIL("bad temp_c");
+	}
+	// Nothing the estimator could have learned.
+	float len = m_vec3_len(out->bias_deg_s);
+	if (len > p->max_dev_deg_s * 1.001f) {
+		RECORD_FAIL("bias %.4f deg/s beyond max_dev_deg_s %.4f", (double)len, (double)p->max_dev_deg_s);
+	}
+
+	return true;
+}
+
+#undef RECORD_FAIL
+
+float
+m_imu_3dof_gyro_bias_record_seed_sd(const struct m_imu_3dof_gyro_bias_record *rec,
+                                    const struct m_imu_3dof_gyro_bias_params *p,
+                                    int64_t now_unix_s,
+                                    float temp_c)
+{
+	double elapsed_s = now_unix_s > rec->saved_unix_s ? (double)(now_unix_s - rec->saved_unix_s) : 0.0;
+	double walk = (double)p->walk_deg_s_sqrt_s;
+	double var = (double)rec->sd_deg_s * (double)rec->sd_deg_s + walk * walk * elapsed_s;
+
+	if (isfinite(temp_c) && isfinite(rec->temp_c)) {
+		double t = (double)p->seed_temp_coeff_deg_s_c * fabs((double)temp_c - (double)rec->temp_c);
+		var += t * t;
+	}
+
+	double lo = (double)p->seed_min_sd_deg_s;
+	double hi = fmax((double)p->init_sd_deg_s, lo);
+	return (float)fmin(fmax(sqrt(var), lo), hi);
+}
+
+void
+m_imu_3dof_gyro_bias_seed(struct m_imu_3dof *f, const struct xrt_vec3 *bias_rad_s, float sd_deg_s)
+{
+	if ((f->flags & M_IMU_3DOF_AUTO_GYRO_BIAS) == 0) {
+		return;
+	}
+
+	const struct m_imu_3dof_gyro_bias_params *p = &f->bias_est.params;
+
+	struct xrt_vec3 dev = m_vec3_sub(*bias_rad_s, f->bias_est.origin);
+	float max_dev = (float)DEG_TO_RAD((double)p->max_dev_deg_s);
+	float dev_len = m_vec3_len(dev);
+	if (dev_len > max_dev) {
+		dev = m_vec3_mul_scalar(dev, max_dev / dev_len);
+	}
+	f->gyro_bias.value = m_vec3_add(f->bias_est.origin, dev);
+
+	double sd = DEG_TO_RAD((double)sd_deg_s);
+	double max_sd = DEG_TO_RAD((double)p->max_dev_deg_s);
+	sd = fmin(sd, max_sd);
+	f->bias_est.var = sd * sd;
+	f->bias_est.var_valid = true;
+	f->bias_est.sd_deg_s = (float)RAD_TO_DEG(sd);
+	// The walk starts at the next sample.
+	f->bias_est.last_learn_ns = 0;
+	f->bias_est.seeded = true;
+
+	// Held blocks were judged against the old bias, start collecting afresh.
+	f->bias_est.held_count = 0;
+}
+
+void
+m_imu_3dof_gyro_bias_get_record(const struct m_imu_3dof *f, struct m_imu_3dof_gyro_bias_record *out)
+{
+	const struct m_imu_3dof_gyro_bias_params *p = &f->bias_est.params;
+
+	out->bias_deg_s = (struct xrt_vec3){
+	    (float)RAD_TO_DEG((double)f->gyro_bias.value.x),
+	    (float)RAD_TO_DEG((double)f->gyro_bias.value.y),
+	    (float)RAD_TO_DEG((double)f->gyro_bias.value.z),
+	};
+
+	double var = 0.0;
+	if (f->bias_est.var_valid) {
+		var = f->bias_est.var;
+		if (f->bias_est.last_learn_ns != 0 && f->last.timestamp_ns > f->bias_est.last_learn_ns) {
+			double walk = DEG_TO_RAD((double)p->walk_deg_s_sqrt_s);
+			var += walk * walk * (double)(f->last.timestamp_ns - f->bias_est.last_learn_ns) / DUR_1S_IN_NS;
+		}
+	} else {
+		double sd = DEG_TO_RAD((double)p->init_sd_deg_s);
+		var = sd * sd;
+	}
+	out->sd_deg_s = (float)RAD_TO_DEG(sqrt(var));
+	out->learned_s = f->bias_est.learned_s;
 }
 
 //! Throw away everything not yet learned and wait @ref settle_s before collecting again.
@@ -258,6 +490,7 @@ m_imu_3dof_add_vars(struct m_imu_3dof *f, void *root, const char *prefix)
 	ADD_RO(ro_f32, sd_deg_s)
 	ADD_RO(ro_i32, held_count)
 	ADD_RO(ro_f64, learned_s)
+	ADD_RO(bool, seeded)
 	ADD_RO(ro_u32, commits)
 	ADD_RO(ro_u32, rejects_sample)
 	ADD_RO(ro_u32, rejects_block)
@@ -410,6 +643,9 @@ bias_est_learn(struct m_imu_3dof *f, uint64_t timestamp_ns, struct xrt_vec3 z, d
 		double sd = DEG_TO_RAD((double)p->init_sd_deg_s);
 		f->bias_est.var = sd * sd;
 		f->bias_est.var_valid = true;
+		f->bias_est.last_learn_ns = timestamp_ns;
+	}
+	if (f->bias_est.last_learn_ns == 0) {
 		f->bias_est.last_learn_ns = timestamp_ns;
 	}
 
@@ -595,6 +831,11 @@ bias_est_update(struct m_imu_3dof *f,
 		f->bias_est.accel_mean_valid = false;
 		f->bias_est.is_still = false;
 		return;
+	}
+
+	// Seeded: the bias starts walking from the first sample after.
+	if (f->bias_est.var_valid && f->bias_est.last_learn_ns == 0) {
+		f->bias_est.last_learn_ns = timestamp_ns;
 	}
 
 	if (!f->bias_est.accel_mean_valid || dt > BIAS_EST_MAX_DT_S) {

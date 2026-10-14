@@ -124,6 +124,7 @@ if(XRT_BUILD_DRIVER_XREAL_AIR)
 		drv_xreal_air STATIC xreal_air/xreal_air_hmd.h xreal_air/xreal_air_hmd.c
 				     xreal_air/xreal_air_interface.h xreal_air/xreal_air_packet.c
 				     xreal_air/xreal_air_imu_dump.h xreal_air/xreal_air_imu_dump.c
+				     xreal_air/xreal_air_gyro_bias_store.h xreal_air/xreal_air_gyro_bias_store.c
 		)
 	target_link_libraries(
 		drv_xreal_air PRIVATE xrt-interfaces HIDAPI::hidapi aux_util xrt-external-cjson
