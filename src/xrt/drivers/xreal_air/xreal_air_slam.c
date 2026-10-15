@@ -138,9 +138,9 @@ DEBUG_GET_ONCE_FLOAT_OPTION(xreal_air_slam_kb4_step_px, "XREAL_AIR_SLAM_KB4_STEP
 #define IMU_FREQUENCY 1000.0
 #define CAMERA_FREQUENCY 30.0
 
-//! A new SLAM pose this far from the previous one (or after this long) = the tracker re-initialised.
+//! A new SLAM pose this far from the previous one (without a stall between) = the tracker re-initialised.
 #define JUMP_DISTANCE_M 0.25f
-#define JUMP_MAX_DT_NS ((int64_t)500 * U_TIME_1MS_IN_NS)
+#define JUMP_ANGLE_DEG 25.0f //!< Between two 30 Hz poses: 750 deg/s, faster than heads turn.
 
 //! Frames are only pushed once the tracker has had IMU samples for this long before them.
 #define FIRST_FRAME_IMU_LEAD_NS ((int64_t)100 * U_TIME_1MS_IN_NS)
@@ -178,7 +178,9 @@ struct xreal_air_slam
 	int64_t first_slam_ts;
 	int64_t last_slam_ts;
 	struct xrt_vec3 last_slam_pos;
-	bool tracking; //!< For the log lines on changes.
+	struct xrt_quat last_slam_rot;
+	uint32_t world_id; //!< Bumped on every detected re-initialisation.
+	bool tracking;     //!< For the log lines on changes.
 
 	// Camera thread only.
 	int64_t last_frame_ts;
@@ -579,14 +581,24 @@ get_slam_head_locked(struct xreal_air_slam *s, int64_t at_ns, struct xrt_space_r
 			                     latest.pose.position.y - s->last_slam_pos.y,
 			                     latest.pose.position.z - s->last_slam_pos.z};
 			const float dist = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
-			if (dist > JUMP_DISTANCE_M && latest_ts - s->last_slam_ts < JUMP_MAX_DT_NS) {
+			const float dot = fabsf(math_quat_dot(&latest.pose.orientation, &s->last_slam_rot));
+			const float angle_deg = 2.0f * acosf(dot > 1.0f ? 1.0f : dot) * 180.0f / (float)M_PI;
+			if (latest_ts - s->last_slam_ts > s->stale_ns) {
+				// Back from a stall: same world, but let it settle again before following it.
+				s->first_slam_ts = latest_ts;
+				SLAM_NOTE(s, "SLAM poses again after %.1f s, warming up",
+				          (double)(latest_ts - s->last_slam_ts) / U_TIME_1S_IN_NS);
+			} else if (dist > JUMP_DISTANCE_M || angle_deg > JUMP_ANGLE_DEG) {
 				s->stats.discontinuities++;
+				s->world_id++;
 				s->first_slam_ts = latest_ts; // Warm up again.
-				SLAM_NOTE(s, "SLAM pose jumped %.2f m, treating it as a re-initialisation", dist);
+				SLAM_NOTE(s, "SLAM pose jumped %.2f m / %.0f deg, treating it as a re-initialisation",
+				          dist, angle_deg);
 			}
 		}
 		s->last_slam_ts = latest_ts;
 		s->last_slam_pos = latest.pose.position;
+		s->last_slam_rot = latest.pose.orientation;
 	}
 
 	const int64_t now = (int64_t)os_monotonic_get_ns();
@@ -615,7 +627,7 @@ xreal_air_slam_get_head_pose(struct xreal_air_slam *s,
 
 	struct xrt_space_relation head;
 	const bool tracking = get_slam_head_locked(s, at_timestamp_ns, &head);
-	xreal_air_pose_blend_update(&s->blend, at_timestamp_ns, tracking ? &head : NULL, fusion, out);
+	xreal_air_pose_blend_update(&s->blend, at_timestamp_ns, tracking ? &head : NULL, s->world_id, fusion, out);
 
 	if (tracking != s->tracking) {
 		s->tracking = tracking;

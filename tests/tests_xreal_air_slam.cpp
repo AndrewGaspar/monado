@@ -314,7 +314,7 @@ TEST_CASE("xreal_air_pose_blend")
 	// 3DoF only: passes the fusion through, position at the origin.
 	const xrt_quat fusion_q = axis_angle(0, 1, 0, 20);
 	xrt_space_relation fusion = orientation_relation(fusion_q);
-	xreal_air_pose_blend_update(&b, 10 * s, NULL, &fusion, &out);
+	xreal_air_pose_blend_update(&b, 10 * s, NULL, 0, &fusion, &out);
 	CHECK(quat_angle_deg(out.pose.orientation, fusion_q) < 0.01f);
 	CHECK(out.pose.position.x == 0.0f);
 	CHECK_FALSE(b.slam_active);
@@ -331,7 +331,7 @@ TEST_CASE("xreal_air_pose_blend")
 
 	SECTION("Acquiring SLAM does not move the output")
 	{
-		xreal_air_pose_blend_update(&b, 10 * s, &slam, &fusion, &out);
+		xreal_air_pose_blend_update(&b, 10 * s, &slam, 0, &fusion, &out);
 		CHECK(b.slam_active);
 		CHECK(b.slam_acquired == 1);
 		CHECK(quat_angle_deg(out.pose.orientation, fusion_q) < 0.05f);
@@ -345,7 +345,7 @@ TEST_CASE("xreal_air_pose_blend")
 			// Move 1 m along SLAM +x after the tilt fade; the output heading is SLAM's turned by
 			// +90 degrees about Y, so that is -z in the output.
 			xrt_space_relation moved = pose_relation(slam_q, {slam_p.x + 1.0f, slam_p.y, slam_p.z});
-			xreal_air_pose_blend_update(&b, 12 * s, &moved, &fusion, &out);
+			xreal_air_pose_blend_update(&b, 12 * s, &moved, 0, &fusion, &out);
 			CHECK(out.pose.position.x == Approx(0).margin(0.05));
 			CHECK(out.pose.position.y == Approx(0).margin(0.05));
 			CHECK(out.pose.position.z == Approx(-1.0).margin(0.05));
@@ -362,9 +362,22 @@ TEST_CASE("xreal_air_pose_blend")
 			CHECK(out_up.z == Approx(slam_up.z).margin(1e-4));
 		}
 
+		SECTION("A re-initialisation while tracking does not move the output")
+		{
+			xreal_air_pose_blend_update(&b, 12 * s, &slam, 0, &fusion, &out);
+			const xrt_pose before = out.pose;
+			xrt_space_relation reinit = pose_relation(axis_angle(0, 1, 0, 0), {0, 0, 0});
+			xreal_air_pose_blend_update(&b, 12 * s + 1000, &reinit, 7, &fusion, &out);
+			CHECK(b.slam_acquired == 2);
+			CHECK(quat_angle_deg(out.pose.orientation, before.orientation) < 0.05f);
+			CHECK(out.pose.position.x == Approx(before.position.x).margin(1e-4));
+			CHECK(out.pose.position.y == Approx(before.position.y).margin(1e-4));
+			CHECK(out.pose.position.z == Approx(before.position.z).margin(1e-4));
+		}
+
 		SECTION("The tilt correction fades, it does not snap")
 		{
-			xreal_air_pose_blend_update(&b, 10 * s + s / 2, &slam, &fusion, &out);
+			xreal_air_pose_blend_update(&b, 10 * s + s / 2, &slam, 0, &fusion, &out);
 			const float half = quat_angle_deg(out.pose.orientation, fusion_q);
 			CHECK(half > 0.5f);
 			CHECK(half < 1.5f);
@@ -373,13 +386,13 @@ TEST_CASE("xreal_air_pose_blend")
 		SECTION("Losing SLAM holds the position and keeps the orientation")
 		{
 			xrt_space_relation moved = pose_relation(slam_q, {slam_p.x, slam_p.y + 0.5f, slam_p.z});
-			xreal_air_pose_blend_update(&b, 13 * s, &moved, &fusion, &out);
+			xreal_air_pose_blend_update(&b, 13 * s, &moved, 0, &fusion, &out);
 			const xrt_pose before = out.pose;
 
 			// The fusion has its own idea of yaw by now.
 			const xrt_quat drifted = axis_angle(0, 1, 0, 45);
 			xrt_space_relation f2 = orientation_relation(drifted);
-			xreal_air_pose_blend_update(&b, 13 * s + 1000, NULL, &f2, &out);
+			xreal_air_pose_blend_update(&b, 13 * s + 1000, NULL, 0, &f2, &out);
 			CHECK_FALSE(b.slam_active);
 			CHECK(b.slam_lost == 1);
 			CHECK(quat_angle_deg(out.pose.orientation, before.orientation) < 0.05f);
@@ -391,17 +404,43 @@ TEST_CASE("xreal_air_pose_blend")
 			xrt_quat turned_q, delta = axis_angle(0, 1, 0, 10);
 			math_quat_rotate(&delta, &drifted, &turned_q);
 			xrt_space_relation f3 = orientation_relation(turned_q);
-			xreal_air_pose_blend_update(&b, 20 * s, NULL, &f3, &out);
+			xreal_air_pose_blend_update(&b, 20 * s, NULL, 0, &f3, &out);
 			const float turned = quat_angle_deg(out.pose.orientation, before.orientation);
 			CHECK(turned == Approx(10.0f).margin(2.5f)); // 10 deg yaw, plus the faded-out tilt
 
-			SECTION("Re-acquiring does not move the output either")
+			SECTION("Re-acquiring the same world starts in place, then glides back to the old alignment")
+			{
+				const xrt_pose last = out.pose;
+				// The head moved 0.3 m along SLAM +y during the stall, SLAM saw it, the held
+				// position did not.
+				xrt_space_relation back =
+				    pose_relation(slam_q, {slam_p.x, slam_p.y + 0.5f + 0.3f, slam_p.z});
+				xreal_air_pose_blend_update(&b, 21 * s, &back, 0, &f3, &out);
+				CHECK(b.slam_acquired == 2);
+				CHECK(quat_angle_deg(out.pose.orientation, last.orientation) < 0.05f);
+				CHECK(out.pose.position.y == Approx(last.position.y).margin(1e-4));
+
+				// After the glide the room is where it was before the stall: SLAM +y is
+				// output +y (the alignment's yaw keeps it vertical), 0.8 m above the start.
+				xreal_air_pose_blend_update(&b, 21 * s + XREAL_AIR_POSE_BLEND_GLIDE_NS, &back, 0, &f3,
+				                            &out);
+				CHECK(out.pose.position.x == Approx(0).margin(0.05));
+				CHECK(out.pose.position.y == Approx(0.8).margin(0.01));
+				CHECK(out.pose.position.z == Approx(0).margin(0.05));
+			}
+
+			SECTION("Re-acquiring a new world (re-initialised SLAM) re-anchors for good")
 			{
 				const xrt_pose last = out.pose;
 				xrt_space_relation again = pose_relation(axis_angle(0, 1, 0, 150), {5, 5, 5});
-				xreal_air_pose_blend_update(&b, 21 * s, &again, &f3, &out);
+				xreal_air_pose_blend_update(&b, 21 * s, &again, 1, &f3, &out);
 				CHECK(b.slam_acquired == 2);
 				CHECK(quat_angle_deg(out.pose.orientation, last.orientation) < 0.05f);
+				CHECK(out.pose.position.x == Approx(last.position.x).margin(1e-4));
+				CHECK(out.pose.position.y == Approx(last.position.y).margin(1e-4));
+				CHECK(out.pose.position.z == Approx(last.position.z).margin(1e-4));
+
+				xreal_air_pose_blend_update(&b, 30 * s, &again, 1, &f3, &out);
 				CHECK(out.pose.position.x == Approx(last.position.x).margin(1e-4));
 				CHECK(out.pose.position.y == Approx(last.position.y).margin(1e-4));
 				CHECK(out.pose.position.z == Approx(last.position.z).margin(1e-4));
