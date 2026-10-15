@@ -1416,6 +1416,18 @@ t_slam_start(struct xrt_tracked_slam *xts)
 	return 0;
 }
 
+extern "C" bool
+t_slam_get_latest_pose(struct xrt_tracked_slam *xts, timepoint_ns *out_ts, struct xrt_space_relation *out_relation)
+{
+	auto &t = *container_of(xts, TrackerSlam, base);
+	int64_t ts = 0;
+	if (!t.slam_rels.get_latest(&ts, out_relation)) {
+		return false;
+	}
+	*out_ts = ts;
+	return true;
+}
+
 extern "C" void
 t_slam_fill_default_config(struct t_slam_tracker_config *config)
 {
@@ -1432,6 +1444,7 @@ t_slam_fill_default_config(struct t_slam_tracker_config *config)
 	config->features_stat = debug_get_bool_option_slam_features_stat();
 	config->cam_count = int(debug_get_num_option_slam_cam_count());
 	config->slam_calib = NULL;
+	config->send_calib_with_config_file = false;
 }
 
 extern "C" int
@@ -1490,6 +1503,9 @@ t_slam_create(struct xrt_frame_context *xfctx,
 	if (!config_file) {
 		SLAM_INFO("Using calibration from driver and default pipeline settings");
 		send_calibration(t, *config->slam_calib); // Not null because of `some_calib`
+	} else if (some_calib && config->send_calib_with_config_file) {
+		SLAM_INFO("Using calibration from driver and pipeline settings from '%s'", config_file);
+		send_calibration(t, *config->slam_calib);
 	} else {
 		SLAM_INFO("Using sensor calibration provided by the SLAM_CONFIG file");
 	}

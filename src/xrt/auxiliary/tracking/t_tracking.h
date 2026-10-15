@@ -674,6 +674,10 @@ struct t_slam_tracker_config
 
 	//!< Instead of a slam_config file you can set custom calibration data
 	const struct t_slam_calibration *slam_calib;
+
+	//! Send @ref slam_calib even when a @ref slam_config file is given too, the file then only carries
+	//! the pipeline settings (the SLAM system must accept a config file without calibration).
+	bool send_calib_with_config_file;
 };
 
 /*!
@@ -698,6 +702,16 @@ t_slam_create(struct xrt_frame_context *xfctx,
  */
 int
 t_slam_start(struct xrt_tracked_slam *xts);
+
+/*!
+ * The newest pose the SLAM system itself produced (no prediction or filtering), with its timestamp.
+ * Lets a driver tell whether the tracker is still producing poses before trusting predictions.
+ *
+ * @return false if the tracker has not produced any pose yet.
+ * @public @memberof xrt_tracked_slam
+ */
+bool
+t_slam_get_latest_pose(struct xrt_tracked_slam *xts, timepoint_ns *out_ts, struct xrt_space_relation *out_relation);
 
 /*
  *
