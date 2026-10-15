@@ -27,6 +27,13 @@ if(XRT_HAVE_OPENCV)
 	target_link_libraries(cli PRIVATE aux_tracking)
 endif()
 
+target_sources(cli PRIVATE cli_cmd_xreal_slam_replay.c)
+if(XRT_BUILD_DRIVER_XREAL_AIR AND XRT_FEATURE_SLAM)
+	target_sources(cli PRIVATE cli_xreal_image.cpp cli_xreal_image.h)
+	target_include_directories(cli SYSTEM PRIVATE ${OpenCV_INCLUDE_DIRS})
+	target_link_libraries(cli PRIVATE drv_xreal_air ${OpenCV_LIBRARIES})
+endif()
+
 set_target_properties(cli PROPERTIES OUTPUT_NAME monado-cli PREFIX "")
 
 target_link_libraries(
