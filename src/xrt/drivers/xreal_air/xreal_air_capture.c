@@ -12,6 +12,7 @@
 #include "xreal_air_camera_decode.h"
 #include "xreal_air_camera_pairing.h"
 #include "xreal_air_record.h"
+#include "xreal_air_slam.h"
 
 #include "math/m_clock_tracking.h"
 #include "os/os_threading.h"
@@ -78,6 +79,9 @@ DEBUG_GET_ONCE_NUM_OPTION(xreal_air_pair_tolerance_us, "XREAL_AIR_PAIR_TOLERANCE
 struct xreal_air_capture
 {
 	enum u_logging_level log_level;
+
+	//! The 6DoF tracker fed with the IMU samples and stereo pairs, not owned, may be NULL.
+	struct xreal_air_slam *slam;
 
 	//! Opens the camera (retrying until it shows up), then idles until destroyed.
 	struct os_thread_helper oth;
@@ -349,6 +353,16 @@ on_pair(void *ctx, void *left_item, void *right_item)
 	}
 	os_mutex_unlock(&cap->lock);
 
+	/*
+	 * Only pairs timed on the IMU's clock: the camera's own mapping is ~26 ms off (its transport
+	 * latency), which the tracker would take as a sensor time offset.
+	 */
+	const bool on_imu_clock = pair_ns == items[XREAL_AIR_CAM_LEFT]->info.imu_clock_ns;
+	if (cap->slam != NULL && !warmup && on_imu_clock) {
+		xreal_air_slam_push_stereo(cap->slam, pair_ns, items[XREAL_AIR_CAM_LEFT]->info.telemetry.exposure,
+		                           items[XREAL_AIR_CAM_LEFT]->frame, items[XREAL_AIR_CAM_RIGHT]->frame);
+	}
+
 	cap->gui.pairs++;
 	free_pair_item(items[0]);
 	free_pair_item(items[1]);
@@ -502,16 +516,17 @@ open_thread(void *ptr)
  */
 
 struct xreal_air_capture *
-xreal_air_capture_create(enum u_logging_level log_level)
+xreal_air_capture_create(enum u_logging_level log_level, struct xreal_air_slam *slam)
 {
 	const char *record_path = debug_get_option_xreal_air_euroc_record();
 	const bool record = record_path != NULL && record_path[0] != '\0';
-	if (!record && !debug_get_bool_option_xreal_air_cameras()) {
+	if (!record && !debug_get_bool_option_xreal_air_cameras() && slam == NULL) {
 		return NULL;
 	}
 
 	struct xreal_air_capture *cap = U_TYPED_CALLOC(struct xreal_air_capture);
 	cap->log_level = log_level;
+	cap->slam = slam;
 	cap->last_imu_euroc_ns = -1;
 	cap->last_pair_euroc_ns = -1;
 	xreal_air_cam_pairer_init(&cap->pairer,
@@ -660,6 +675,11 @@ xreal_air_capture_push_imu(struct xreal_air_capture *cap,
 	cap->gui.imu_samples++;
 
 	os_mutex_unlock(&cap->lock);
+
+	// Same clock and frame as the recorded mav0/imu0, never blocks.
+	if (cap->slam != NULL && imu.euroc_ns > 0) {
+		xreal_air_slam_push_imu(cap->slam, imu.euroc_ns, &imu.gyro, &imu.accel);
+	}
 }
 
 void

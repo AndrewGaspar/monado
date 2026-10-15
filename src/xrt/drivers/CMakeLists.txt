@@ -144,7 +144,17 @@ if(XRT_BUILD_DRIVER_XREAL_AIR)
 			xreal_air/xreal_air_record.h
 			xreal_air/xreal_air_record.c
 		)
-	target_link_libraries(drv_xreal_air PRIVATE aux_math aux_os xrt-external-stb)
+	# Opt-in 6DoF (XREAL_AIR_SLAM=1) through t_slam / VIT, stubbed out without XRT_FEATURE_SLAM.
+	target_sources(
+		drv_xreal_air
+		PRIVATE xreal_air/xreal_air_slam.h
+			xreal_air/xreal_air_slam.c
+			xreal_air/xreal_air_slam_calib.h
+			xreal_air/xreal_air_slam_calib.c
+			xreal_air/xreal_air_pose_blend.h
+			xreal_air/xreal_air_pose_blend.c
+		)
+	target_link_libraries(drv_xreal_air PRIVATE aux_math aux_os aux_tracking xrt-external-stb)
 	if(ZLIB_FOUND)
 		target_link_libraries(drv_xreal_air PRIVATE ${ZLIB_LIBRARIES})
 		target_include_directories(drv_xreal_air PRIVATE ${ZLIB_INCLUDE_DIRS})

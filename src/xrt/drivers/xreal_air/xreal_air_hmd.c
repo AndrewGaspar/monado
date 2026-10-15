@@ -31,6 +31,7 @@
 #include "xrt/xrt_defines.h"
 
 #include "xreal_air_capture.h"
+#include "xreal_air_slam.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -152,6 +153,9 @@ struct xreal_air_hmd
 
 	//! Opt-in SLAM camera capture / dataset recording, NULL unless enabled by the environment.
 	struct xreal_air_capture *capture;
+
+	//! Opt-in 6DoF tracking (XREAL_AIR_SLAM=1), fed by @ref capture, NULL otherwise.
+	struct xreal_air_slam *slam;
 
 	struct
 	{
@@ -679,6 +683,11 @@ handle_sensor_control_cal_data_get_next_segment(struct xreal_air_hmd *hmd,
 		if (hmd->capture != NULL) {
 			xreal_air_capture_set_calibration(hmd->capture, hmd->calibration_buffer,
 			                                  hmd->calibration_buffer_len, &hmd->calibration);
+		}
+
+		// Creates the tracker on its own thread.
+		if (hmd->slam != NULL) {
+			xreal_air_slam_set_calibration(hmd->slam, &hmd->calibration);
 		}
 
 		// Free calibration buffer.
@@ -1338,6 +1347,9 @@ teardown(struct xreal_air_hmd *hmd)
 	// After the sensor thread, which pushes into it, has stopped.
 	xreal_air_capture_destroy(&hmd->capture);
 
+	// After the capture, which feeds it.
+	xreal_air_slam_destroy(&hmd->slam);
+
 	os_thread_helper_destroy(&hmd->oth);
 	os_mutex_destroy(&hmd->device_mutex);
 }
@@ -1465,8 +1477,7 @@ xreal_air_hmd_get_tracked_pose(struct xrt_device *xdev,
 	m_relation_history_get(hmd->relation_hist, at_timestamp_ns, &relation);
 	relation.relation_flags = flags; // Needed after history_get
 
-	*out_relation = relation;
-	struct xrt_quat *orientation = &out_relation->pose.orientation;
+	struct xrt_quat *orientation = &relation.pose.orientation;
 
 	// Make sure that the orientation is valid.
 	if (math_quat_dot(orientation, orientation) > 0.0f) {
@@ -1474,6 +1485,14 @@ xreal_air_hmd_get_tracked_pose(struct xrt_device *xdev,
 	} else {
 		orientation->w = 1.0f;
 	}
+
+	if (hmd->slam != NULL) {
+		// 6DoF while SLAM tracks, this 3DoF orientation (with the position held) while it does not.
+		xreal_air_slam_get_head_pose(hmd->slam, at_timestamp_ns, &relation, out_relation);
+		return XRT_SUCCESS;
+	}
+
+	*out_relation = relation;
 
 	return XRT_SUCCESS;
 }
@@ -1643,8 +1662,14 @@ xreal_air_hmd_create_device(struct os_hid_device *sensor_device,
 	os_mutex_init(&hmd->device_mutex);
 	os_thread_helper_init(&hmd->oth);
 
-	// Before the sensor thread starts, it feeds the capture.
-	hmd->capture = xreal_air_capture_create(hmd->log_level);
+	// Before the sensor thread starts, it feeds the capture (which feeds the SLAM).
+	hmd->slam = xreal_air_slam_create(hmd->log_level);
+	hmd->capture = xreal_air_capture_create(hmd->log_level, hmd->slam);
+	if (hmd->slam != NULL && hmd->capture == NULL) {
+		XREAL_AIR_ERROR(hmd, "6DoF requested but the camera capture could not be created, staying 3DoF");
+		xreal_air_slam_destroy(&hmd->slam);
+	}
+	hmd->base.supported.position_tracking = hmd->slam != NULL;
 
 	if (!sensor_device) {
 		goto cleanup;

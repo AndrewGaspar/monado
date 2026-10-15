@@ -51,7 +51,7 @@ if(XRT_BUILD_DRIVER_HANDTRACKING)
 endif()
 if(XRT_BUILD_DRIVER_XREAL_AIR)
 	list(APPEND tests tests_xreal_air_camera_decode tests_xreal_air_camera_pairing
-	     tests_xreal_air_gyro_bias_store
+	     tests_xreal_air_gyro_bias_store tests_xreal_air_slam
 	     )
 endif()
 
@@ -152,4 +152,12 @@ if(XRT_BUILD_DRIVER_XREAL_AIR)
 	target_include_directories(
 		tests_xreal_air_camera_pairing PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers
 		)
+	# The 6DoF calibration conversion and pose hand-over are pure, build them straight in.
+	target_sources(
+		tests_xreal_air_slam
+		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/xreal_air/xreal_air_slam_calib.c
+			${PROJECT_SOURCE_DIR}/src/xrt/drivers/xreal_air/xreal_air_pose_blend.c
+		)
+	target_include_directories(tests_xreal_air_slam PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers)
+	target_link_libraries(tests_xreal_air_slam PRIVATE aux_math xrt-interfaces)
 endif()
