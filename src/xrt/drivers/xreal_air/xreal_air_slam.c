@@ -142,6 +142,9 @@ DEBUG_GET_ONCE_FLOAT_OPTION(xreal_air_slam_kb4_step_px, "XREAL_AIR_SLAM_KB4_STEP
 #define JUMP_DISTANCE_M 0.25f
 #define JUMP_MAX_DT_NS ((int64_t)500 * U_TIME_1MS_IN_NS)
 
+//! Frames are only pushed once the tracker has had IMU samples for this long before them.
+#define FIRST_FRAME_IMU_LEAD_NS ((int64_t)100 * U_TIME_1MS_IN_NS)
+
 //! How long destroy waits for Basalt to shut down (it can hang in ~OpticalFlowBase).
 #define SHUTDOWN_TIMEOUT_NS ((int64_t)3 * U_TIME_1S_IN_NS)
 
@@ -155,8 +158,9 @@ struct xreal_air_slam
 	uint32_t imu_head;
 	uint32_t imu_count;
 	bool calib_pending;
-	bool calib_received; //!< Only the first calibration creates the tracker.
-	bool forwarding;     //!< The tracker is up, IMU samples are queued.
+	bool calib_received;  //!< Only the first calibration creates the tracker.
+	bool forwarding;      //!< The tracker is up, IMU samples are queued.
+	int64_t first_imu_ts; //!< Of the first forwarded sample, 0 before.
 	struct xreal_air_parsed_calibration calib;
 
 	//! Protects the tracker pointers and the pose state.
@@ -489,6 +493,9 @@ xreal_air_slam_push_imu(struct xreal_air_slam *s,
 
 	os_thread_helper_lock(&s->oth);
 	if (s->forwarding) {
+		if (s->first_imu_ts == 0) {
+			s->first_imu_ts = timestamp_ns;
+		}
 		if (s->imu_count < IMU_QUEUE_SIZE) {
 			s->imu_queue[(s->imu_head + s->imu_count) % IMU_QUEUE_SIZE] = sample;
 			s->imu_count++;
@@ -518,6 +525,14 @@ xreal_air_slam_push_stereo(struct xreal_air_slam *s,
 	os_mutex_unlock(&s->lock);
 
 	if (!ready) {
+		return;
+	}
+
+	// Basalt wants IMU data from before the first frame (it initialises from the accelerometer).
+	os_thread_helper_lock(&s->oth);
+	const int64_t first_imu_ts = s->first_imu_ts;
+	os_thread_helper_unlock(&s->oth);
+	if (first_imu_ts == 0 || timestamp_ns < first_imu_ts + FIRST_FRAME_IMU_LEAD_NS) {
 		return;
 	}
 

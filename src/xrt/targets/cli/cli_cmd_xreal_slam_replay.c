@@ -14,6 +14,9 @@
  * The recording's timestamps are shifted onto the current monotonic clock and played back at 1x
  * with the live arrival latencies, so the stale / warm-up logic sees what it would live.
  *
+ * XREAL_SLAM_REPLAY_GAP=<start_s>,<length_s> drops the camera frames in that window to simulate a
+ * camera stall (3DoF fallback, Basalt's pipeline gap, re-acquisition).
+ *
  * Writes <out_dir>/head_poses.csv (one line per pose query) and, through t_slam's CSV writers,
  * <out_dir>/tracking.csv (raw SLAM poses, Basalt frames, shifted clock).
  *
@@ -280,6 +283,13 @@ cli_cmd_xreal_slam_replay(int argc, const char **argv)
 	const int64_t offset = (int64_t)os_monotonic_get_ns() + 200 * U_TIME_1MS_IN_NS - first;
 	const int64_t end = cams[cam_count - 1].ts + offset + U_TIME_1S_IN_NS;
 
+	// XREAL_SLAM_REPLAY_GAP=<start_s>,<length_s>: drop the camera frames in that window (a stall).
+	double gap_start_s = -1, gap_len_s = 0;
+	const char *gap = getenv("XREAL_SLAM_REPLAY_GAP");
+	if (gap != NULL && sscanf(gap, "%lf,%lf", &gap_start_s, &gap_len_s) == 2) {
+		P("Simulating a camera stall from %.1f s for %.1f s\n", gap_start_s, gap_len_s);
+	}
+
 	size_t ii = 0, ci = 0;
 	int64_t next_query = first + offset;
 	uint64_t queries = 0, queries_tracking = 0;
@@ -304,6 +314,10 @@ cli_cmd_xreal_slam_replay(int argc, const char **argv)
 			m_imu_3dof_update(&fusion, (uint64_t)(r->ts + offset), &a, &g);
 		} else if (t_next == t_cam) {
 			const struct cam_row *r = &cams[ci++];
+			const double rel_s = (double)(r->ts - cams[0].ts) / 1e9;
+			if (rel_s >= gap_start_s && rel_s < gap_start_s + gap_len_s) {
+				continue; // Simulated camera stall.
+			}
 			struct xrt_frame *l = load_frame(dir, 0, r->name);
 			struct xrt_frame *rt = load_frame(dir, 1, r->name);
 			if (l != NULL && rt != NULL) {
