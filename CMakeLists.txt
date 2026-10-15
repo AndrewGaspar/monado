@@ -108,6 +108,7 @@ find_package(bluetooth MODULE)
 find_package(OpenHMD MODULE)
 find_package(
 	OpenCV
+	QUIET
 	COMPONENTS
 		core
 		calib3d
@@ -118,6 +119,23 @@ find_package(
 		video
 		CONFIG
 	)
+if(NOT OpenCV_FOUND)
+	# OpenCV 5 split calib3d into calib, geometry and stereo, and renamed features2d to features.
+	find_package(
+		OpenCV
+		COMPONENTS
+			core
+			calib
+			geometry
+			stereo
+			highgui
+			imgproc
+			imgcodecs
+			features
+			video
+			CONFIG
+		)
+endif()
 find_package(Libusb1 MODULE)
 find_package(JPEG MODULE)
 find_package(realsense2 CONFIG)

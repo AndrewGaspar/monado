@@ -20,6 +20,13 @@
 #include "tracking/t_calibration_opencv.hpp"
 
 #include <opencv2/opencv.hpp>
+#if CV_VERSION_MAJOR >= 5
+// OpenCV 5's umbrella header no longer pulls these in (calib3d was split up).
+#include <opencv2/imgproc.hpp>
+#include <opencv2/calib.hpp>
+#include <opencv2/geometry.hpp>
+#include <opencv2/stereo.hpp>
+#endif
 #include <sys/stat.h>
 #include <utility>
 #include <stdexcept>
