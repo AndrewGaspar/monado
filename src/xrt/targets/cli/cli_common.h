@@ -27,6 +27,9 @@ int
 cli_cmd_xreal_slam_replay(int argc, const char **argv);
 
 int
+cli_cmd_plane_map_replay(int argc, const char **argv);
+
+int
 cli_cmd_info(int argc, const char **argv);
 
 int

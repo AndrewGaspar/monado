@@ -25,6 +25,11 @@
  * Writes <out_dir>/head_poses.csv (one line per pose query) and, through t_slam's CSV writers,
  * <out_dir>/tracking.csv (raw SLAM poses, Basalt frames, shifted clock).
  *
+ * With XREAL_AIR_PLANES=1 the plane detection runs too: every XREAL_SLAM_REPLAY_PLANES_EVERY_S (5)
+ * seconds the tracked planes are printed and appended to <out_dir>/planes.csv (SLAM world, Z up),
+ * at the end the reportable ones go to <out_dir>/planes_final.csv with their outlines (world x y),
+ * the ones the head-space query gives are printed, and so is the CPU time per stage.
+ *
  * @author Andrew Gaspar
  */
 
@@ -47,6 +52,8 @@
 
 #include "xreal_air/xreal_air_hmd.h"
 #include "xreal_air/xreal_air_slam.h"
+
+#include "tracking/t_plane_detector.h"
 
 #include "cli_xreal_image.h"
 
@@ -252,6 +259,109 @@ sleep_until(int64_t t)
 	}
 }
 
+static const char *
+label_str(enum xrt_plane_detector_semantic_type_ext l)
+{
+	switch (l) {
+	case XRT_PLANE_DETECTOR_SEMANTIC_TYPE_FLOOR_EXT: return "FLOOR";
+	case XRT_PLANE_DETECTOR_SEMANTIC_TYPE_PLATFORM_EXT: return "PLATFORM";
+	case XRT_PLANE_DETECTOR_SEMANTIC_TYPE_WALL_EXT: return "WALL";
+	case XRT_PLANE_DETECTOR_SEMANTIC_TYPE_CEILING_EXT: return "CEILING";
+	default: return "-";
+	}
+}
+
+#define REPLAY_MAX_PLANES 64
+
+//! Print and log the tracked planes (SLAM world, Z up) at @p rel_s.
+static void
+dump_planes(struct xreal_air_slam *s, FILE *csv, double rel_s, bool print)
+{
+	struct t_plane planes[REPLAY_MAX_PLANES];
+	struct t_plane_detector_stats st;
+	const uint32_t n = xreal_air_slam_get_planes_debug(s, planes, REPLAY_MAX_PLANES, &st);
+	if (print) {
+		P("Planes at %5.1f s: %u tracked, %u reportable, %u columns (%u peaky), head z %+.3f, floor %+.3f, "
+		  "%" PRIu64 " pairs, %" PRIu64 " landmark batches, world %u gen %" PRIu64 "\n",
+		  rel_s, n, st.planes, st.map.columns, st.map.peaky_columns, st.map.head_z, st.map.floor_z,
+		  st.pairs_processed, st.sparse_batches, st.world_id, st.generation);
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		const struct t_plane *p = &planes[i];
+		if (print && (p->reportable || p->area_m2 >= 0.05f)) {
+			P("  %c #%-4" PRIu64
+			  " %-8s h %+.3f  area %.2f m2 (%3u cells)  center (%+.2f, %+.2f)  %.2f x %.2f m  "
+			  "spread %.0f mm  age %.0f s\n",
+			  p->reportable ? '*' : ' ', p->id, label_str(p->label), p->height, p->area_m2, p->cell_count,
+			  p->center.x, p->center.y, p->extents.x, p->extents.y, p->spread_m * 1000.0f,
+			  (double)(p->last_seen_ns - p->first_seen_ns) / 1e9);
+		}
+		if (csv != NULL) {
+			fprintf(csv, "%.2f,%" PRIu64 ",%d,%s,%.4f,%.3f,%.3f,%.4f,%.3f,%.3f,%.4f,%u,%.4f,%.2f\n", rel_s,
+			        p->id, p->reportable ? 1 : 0, label_str(p->label), p->height, p->center.x, p->center.y,
+			        p->yaw, p->extents.x, p->extents.y, p->area_m2, p->cell_count, p->spread_m,
+			        (double)(p->last_seen_ns - p->first_seen_ns) / 1e9);
+		}
+	}
+}
+
+static void
+final_planes(struct xreal_air_slam *s, const char *out_dir)
+{
+	struct t_plane planes[REPLAY_MAX_PLANES];
+	struct t_plane_detector_stats st;
+	const uint32_t n = xreal_air_slam_get_planes_debug(s, planes, REPLAY_MAX_PLANES, &st);
+
+	char path[1024];
+	snprintf(path, sizeof(path), "%s/planes_final.csv", out_dir);
+	FILE *f = fopen(path, "w");
+	if (f != NULL) {
+		fprintf(f, "#id,label,height,area_m2,cells,spread_m,world x y of the outline...\n");
+		for (uint32_t i = 0; i < n; i++) {
+			const struct t_plane *p = &planes[i];
+			if (!p->reportable) {
+				continue;
+			}
+			fprintf(f, "%" PRIu64 ",%s,%.4f,%.4f,%u,%.4f", p->id, label_str(p->label), p->height,
+			        p->area_m2, p->cell_count, p->spread_m);
+			const float c = cosf(p->yaw), sn = sinf(p->yaw);
+			for (uint32_t v = 0; v < p->vertex_count; v++) {
+				const struct xrt_vec2 *q = &p->vertices[v];
+				fprintf(f, ",%.3f,%.3f", p->center.x + c * q->x - sn * q->y,
+				        p->center.y + sn * q->x + c * q->y);
+			}
+			fprintf(f, "\n");
+		}
+		fclose(f);
+	}
+
+	// What an application gets: the head pose's space, Y up.
+	struct xreal_air_plane *head = calloc(REPLAY_MAX_PLANES, sizeof(*head));
+	const uint32_t hn = head != NULL ? xreal_air_slam_get_planes(s, head, REPLAY_MAX_PLANES) : 0;
+	P("Head-space planes (what XR_EXT_plane_detection reports): %u\n", hn);
+	for (uint32_t i = 0; i < hn; i++) {
+		const struct t_plane_location *l = &head[i].location;
+		struct xrt_vec3 up = {0, 0, 1}, n_out;
+		math_quat_rotate_vec3(&l->pose.orientation, &up, &n_out);
+		P("  #%-4" PRIu64
+		  " %-8s pos (%+.3f, %+.3f, %+.3f) normal (%+.3f, %+.3f, %+.3f) %.2f x %.2f m, %u vertices, "
+		  "flags 0x%x\n",
+		  l->id, label_str(l->semantic_type), l->pose.position.x, l->pose.position.y, l->pose.position.z,
+		  n_out.x, n_out.y, n_out.z, l->extents.x, l->extents.y, l->vertex_count, (unsigned)l->relation_flags);
+	}
+	free(head);
+
+	P("Plane detection CPU, mean / max ms: rectify %.2f / %.2f, SGBM %.2f / %.2f, depth->points %.2f / %.2f, "
+	  "world+map %.2f / %.2f, landmarks %.3f / %.3f, extraction %.2f / %.2f\n",
+	  st.prepare_ms, st.prepare_max_ms, st.match_ms, st.match_max_ms, st.points_ms, st.points_max_ms,
+	  st.integrate_ms, st.integrate_max_ms, st.sparse_ms, st.sparse_max_ms, st.extract_ms, st.extract_max_ms);
+	P("  %" PRIu64 " pairs pushed, %" PRIu64 " processed, %" PRIu64
+	  " dropped, %.0f points/pair into the map, "
+	  "%" PRIu64 " landmark batches (%" PRIu64 " points), %" PRIu64 " extractions, %" PRIu64 " resets\n",
+	  st.pairs_pushed, st.pairs_processed, st.pairs_dropped, st.dense_points_mean, st.sparse_batches,
+	  st.sparse_points, st.extractions, st.resets);
+}
+
 int
 cli_cmd_xreal_slam_replay(int argc, const char **argv)
 {
@@ -335,6 +445,24 @@ cli_cmd_xreal_slam_replay(int argc, const char **argv)
 	struct xrt_vec3 frozen_accel = {0, 0, 0};
 	char frozen_frame[64] = "";
 
+	FILE *planes_csv = NULL;
+	double planes_every_s = 5.0;
+	double next_planes_s = planes_every_s;
+	if (xreal_air_slam_planes_enabled(s)) {
+		const char *e = getenv("XREAL_SLAM_REPLAY_PLANES_EVERY_S");
+		if (e != NULL && atof(e) > 0) {
+			planes_every_s = atof(e);
+			next_planes_s = planes_every_s;
+		}
+		snprintf(path, sizeof(path), "%s/planes.csv", out_dir);
+		planes_csv = fopen(path, "w");
+		if (planes_csv != NULL) {
+			fprintf(planes_csv,
+			        "#t_s,id,reportable,label,height,cx,cy,yaw,extent_x,extent_y,area_m2,cells,"
+			        "spread_m,age_s\n");
+		}
+	}
+
 	size_t ii = 0, ci = 0;
 	int64_t next_query = first + offset;
 	uint64_t queries = 0, queries_tracking = 0;
@@ -416,6 +544,12 @@ cli_cmd_xreal_slam_replay(int argc, const char **argv)
 
 			queries++;
 			queries_tracking += tracking ? 1 : 0;
+
+			const double now_rel_s = (double)(at - QUERY_PREDICT_NS - offset - cams[0].ts) / 1e9;
+			if (xreal_air_slam_planes_enabled(s) && now_rel_s >= next_planes_s) {
+				dump_planes(s, planes_csv, now_rel_s, true);
+				next_planes_s += planes_every_s;
+			}
 			const struct xrt_pose *p = &o.pose;
 			fprintf(out, "%" PRId64 ",%.6f,%.6f,%.6f,%.7f,%.7f,%.7f,%.7f,%d,%.7f,%.7f,%.7f,%.7f,%u\n",
 			        at - offset, p->position.x, p->position.y, p->position.z, p->orientation.x,
@@ -433,6 +567,15 @@ cli_cmd_xreal_slam_replay(int argc, const char **argv)
 	if (of != NULL) {
 		fprintf(of, "%" PRId64 "\n", offset);
 		fclose(of);
+	}
+
+	if (xreal_air_slam_planes_enabled(s)) {
+		const double end_rel_s = (double)(cams[cam_count - 1].ts - cams[0].ts) / 1e9;
+		dump_planes(s, planes_csv, end_rel_s, true);
+		final_planes(s, out_dir);
+	}
+	if (planes_csv != NULL) {
+		fclose(planes_csv);
 	}
 
 	const int64_t t0 = (int64_t)os_monotonic_get_ns();

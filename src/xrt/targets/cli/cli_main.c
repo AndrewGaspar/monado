@@ -36,6 +36,7 @@ cli_print_help(int argc, const char **argv)
 	P("  slambatch  - Runs a sequence of EuRoC datasets with the SLAM tracker.\n");
 	P("  imu-replay - Replay an IMU dump through the 3DoF fusion, compare gyro bias estimation.\n");
 	P("  xreal-slam-replay - Replay an XREAL Air recording through the xreal_air 6DoF (SLAM) path.\n");
+	P("  plane-map-replay  - Re-run the plane map on points dumped with XREAL_AIR_PLANES_DUMP.\n");
 
 	return 1;
 }
@@ -75,6 +76,9 @@ main(int argc, const char **argv)
 	}
 	if (strcmp(argv[1], "xreal-slam-replay") == 0) {
 		return cli_cmd_xreal_slam_replay(argc, argv);
+	}
+	if (strcmp(argv[1], "plane-map-replay") == 0) {
+		return cli_cmd_plane_map_replay(argc, argv);
 	}
 	return cli_print_help(argc, argv);
 }
