@@ -556,6 +556,61 @@ TEST_CASE("xreal_air_wear")
 	CHECK(w.worn);
 }
 
+TEST_CASE("xreal_air_presence")
+{
+	const int64_t debounce = 400 * MS;
+	xreal_air_presence p;
+
+	SECTION("Seeded worn: present from the first query, at service start")
+	{
+		// The glasses were already worn when the service started: no edge ever comes.
+		xreal_air_presence_init(&p, true);
+		CHECK(xreal_air_presence_get(&p, 5 * MS, debounce));
+		CHECK(xreal_air_presence_get(&p, 60000 * MS, debounce));
+
+		// The display coming on (a mode flip, "Open OLED") is no edge.
+		CHECK_FALSE(xreal_air_presence_set(&p, true, 1000 * MS));
+		CHECK(xreal_air_presence_get(&p, 1001 * MS, debounce));
+
+		// Taken off: the first real edge corrects it, after the debounce.
+		CHECK(xreal_air_presence_set(&p, false, 2000 * MS));
+		CHECK(xreal_air_presence_get(&p, 2399 * MS, debounce));
+		CHECK_FALSE(xreal_air_presence_get(&p, 2400 * MS, debounce));
+
+		// Put back on.
+		CHECK(xreal_air_presence_set(&p, true, 3000 * MS));
+		CHECK_FALSE(xreal_air_presence_get(&p, 3100 * MS, debounce));
+		CHECK(xreal_air_presence_get(&p, 3400 * MS, debounce));
+	}
+
+	SECTION("Seeded worn but off at start: corrected by the first edge")
+	{
+		xreal_air_presence_init(&p, true);
+		CHECK(xreal_air_presence_set(&p, false, 750 * MS));
+		CHECK(xreal_air_presence_get(&p, 800 * MS, debounce));
+		CHECK_FALSE(xreal_air_presence_get(&p, 1150 * MS, debounce));
+	}
+
+	SECTION("Seeded not worn (XREAL_AIR_PRESENCE_INITIAL=0): absent until put on")
+	{
+		xreal_air_presence_init(&p, false);
+		CHECK_FALSE(xreal_air_presence_get(&p, 5 * MS, debounce));
+		CHECK_FALSE(xreal_air_presence_set(&p, false, 100 * MS));
+		CHECK(xreal_air_presence_set(&p, true, 750 * MS));
+		CHECK_FALSE(xreal_air_presence_get(&p, 800 * MS, debounce));
+		CHECK(xreal_air_presence_get(&p, 1150 * MS, debounce));
+	}
+
+	SECTION("A flicker shorter than the debounce is never handed out")
+	{
+		xreal_air_presence_init(&p, true);
+		CHECK(xreal_air_presence_set(&p, false, 1000 * MS));
+		CHECK(xreal_air_presence_get(&p, 1100 * MS, debounce));
+		CHECK(xreal_air_presence_set(&p, true, 1200 * MS));
+		CHECK(xreal_air_presence_get(&p, 2000 * MS, debounce));
+	}
+}
+
 //! A 30 Hz pose stream fed to a guard, with the pose query at a fixed latency after each pose.
 struct guard_feed
 {

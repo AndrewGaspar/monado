@@ -32,6 +32,7 @@
 
 #include "xreal_air_capture.h"
 #include "xreal_air_slam.h"
+#include "xreal_air_slam_guard.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -78,6 +79,9 @@ DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_auto_gyro_bias, "XREAL_AIR_AUTO_GYRO_BIAS",
 DEBUG_GET_ONCE_OPTION(xreal_air_gyro_bias_params, "XREAL_AIR_GYRO_BIAS_PARAMS", NULL)
 DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_gyro_bias_persist, "XREAL_AIR_GYRO_BIAS_PERSIST", true)
 DEBUG_GET_ONCE_OPTION(xreal_air_imu_dump, "XREAL_AIR_IMU_DUMP", NULL)
+// The display state the glasses start in (they only push changes, nothing reads it): worn, since
+// their HID side is only enumerated while (recently) worn. The first real edge corrects it.
+DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_presence_initial, "XREAL_AIR_PRESENCE_INITIAL", true)
 
 /*!
  * Private struct for the xreal_air device.
@@ -130,12 +134,9 @@ struct xreal_air_hmd
 	//! Hardware wear signal, protected by the device_mutex. Set from the control
 	//! interface's XREAL_AIR_MSG_P_DISPLAY_TOGGLED (0x6C04) / button-toggle events
 	//! (true = display/panels on = donned, false = doffed). Go through
-	//! xreal_air_set_display_on() so @ref display_on_change_ns tracks the edge.
-	bool display_on;
-	//! os_monotonic time of the last @ref display_on transition (for debounce).
-	timepoint_ns display_on_change_ns;
-	//! Debounced presence last handed out by xreal_air_hmd_get_presence().
-	bool presence_reported;
+	//! xreal_air_set_display_on() so the edge is timed for the debounce and reaches the SLAM.
+	//! Seeded at create (see XREAL_AIR_PRESENCE_INITIAL): the glasses only report changes.
+	struct xreal_air_presence presence;
 
 	uint8_t blend_state;
 	uint8_t control_mode;
@@ -993,17 +994,14 @@ handle_control_heartbeat_start(struct xreal_air_hmd *hmd, const struct xreal_air
 	// TODO
 }
 
-//! Update @ref display_on, stamping @ref display_on_change_ns on a real edge so
-//! xreal_air_hmd_get_presence() can debounce. Callers must hold device_mutex.
+//! Update the raw display state, timing a real edge so xreal_air_hmd_get_presence() can
+//! debounce. Callers must hold device_mutex.
 static void
 xreal_air_set_display_on(struct xreal_air_hmd *hmd, bool on)
 {
-	if (hmd->display_on == on) {
+	if (!xreal_air_presence_set(&hmd->presence, on, (int64_t)os_monotonic_get_ns())) {
 		return;
 	}
-
-	hmd->display_on = on;
-	hmd->display_on_change_ns = (timepoint_ns)os_monotonic_get_ns();
 
 	// The 6DoF tracker cannot see anything useful lying on a desk: it pauses while the glasses are off.
 	if (hmd->slam != NULL) {
@@ -1445,15 +1443,11 @@ xreal_air_hmd_get_presence(struct xrt_device *xdev, bool *out_presence)
 	os_mutex_lock(&hmd->device_mutex);
 
 	// Accept the raw hardware state only once it has held steady for the debounce
-	// window. A pre-existing stable state (e.g. donned before session begin, whose
-	// edge is far in the past) is accepted on the first read, so the session-begin
-	// snapshot is correct; a fresh flip is held until it settles.
-	const timepoint_ns now = (timepoint_ns)os_monotonic_get_ns();
-	if (hmd->display_on != hmd->presence_reported &&
-	    (now - hmd->display_on_change_ns) >= XREAL_AIR_PRESENCE_DEBOUNCE_NS) {
-		hmd->presence_reported = hmd->display_on;
-	}
-	*out_presence = hmd->presence_reported;
+	// window. A pre-existing stable state (the seeded one, or an edge far in the past)
+	// is accepted on the first read, so the session-begin snapshot is correct; a fresh
+	// flip is held until it settles.
+	*out_presence =
+	    xreal_air_presence_get(&hmd->presence, (int64_t)os_monotonic_get_ns(), XREAL_AIR_PRESENCE_DEBOUNCE_NS);
 
 	os_mutex_unlock(&hmd->device_mutex);
 
@@ -1634,9 +1628,6 @@ xreal_air_hmd_create_device(struct os_hid_device *sensor_device,
 	}
 
 	hmd->static_id = 0;
-	hmd->display_on = false;
-	hmd->display_on_change_ns = 0;
-	hmd->presence_reported = false;
 	hmd->blend_state = XREAL_AIR_BLEND_STATE_DEFAULT;
 	hmd->control_mode = XREAL_AIR_CONTROL_MODE_BRIGHTNESS;
 	hmd->imu_stream_state = 0;
@@ -1675,6 +1666,19 @@ xreal_air_hmd_create_device(struct os_hid_device *sensor_device,
 		xreal_air_slam_destroy(&hmd->slam);
 	}
 	hmd->base.supported.position_tracking = hmd->slam != NULL;
+
+	// The glasses only push display (wear) changes, so the state they start in is an assumption.
+	// Seeded before the read thread starts. Worn agrees with the SLAM's own "worn until told
+	// otherwise", so it is not forwarded (no edge, no tracker restart); not worn is, so the SLAM
+	// pauses too.
+	const bool presence_initial = debug_get_bool_option_xreal_air_presence_initial();
+	xreal_air_presence_init(&hmd->presence, presence_initial);
+	if (!presence_initial && hmd->slam != NULL) {
+		xreal_air_slam_set_display_on(hmd->slam, false);
+	}
+	U_LOG_XDEV_IFL_I(&hmd->base, hmd->log_level,
+	                 "Initial user presence: %s (XREAL_AIR_PRESENCE_INITIAL), until the glasses report a change",
+	                 presence_initial ? "worn" : "not worn");
 
 	if (!sensor_device) {
 		goto cleanup;

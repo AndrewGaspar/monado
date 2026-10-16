@@ -10,6 +10,8 @@
  *  - @ref xreal_air_still: is the IMU at rest (glasses lying on a desk)?
  *  - @ref xreal_air_wear: the debounced wear state from the glasses' display on/off (proximity)
  *    edges. Unknown until the first edge, and then assumed worn.
+ *  - @ref xreal_air_presence: the same display on/off edges, debounced into the user presence the
+ *    HMD hands out (XR_EXT_user_presence), seeded at start since the glasses only report changes.
  *  - @ref xreal_air_slam_guard: looks at every new SLAM pose. Tells a stall (pose gap, same world)
  *    from a re-initialisation (one discontinuity, new world) from a divergence (implausible motion:
  *    too fast for a head, or moving while the IMU is at rest, or discontinuities in a row), and
@@ -103,6 +105,38 @@ xreal_air_wear_raw(struct xreal_air_wear *w, bool on, int64_t now_ns);
 //! Debounce: true when @ref xreal_air_wear::worn changed in this call.
 bool
 xreal_air_wear_update(struct xreal_air_wear *w, int64_t now_ns, int64_t debounce_ns);
+
+
+/*
+ *
+ * User presence.
+ *
+ */
+
+/*!
+ * The glasses push their display state only when it changes (0x6C04 DISPLAY_TOGGLED, the display
+ * toggle button, the OLED text log); there is no known request that reads it. So the state at start
+ * is an assumption: the HID side of the glasses is only enumerated while they are (recently) worn,
+ * so they start present, and the first real edge corrects it.
+ */
+struct xreal_air_presence
+{
+	bool display_on;   //!< The last raw display state.
+	int64_t change_ns; //!< When @ref display_on last changed, 0 for the seeded state.
+	bool reported;     //!< The debounced presence last handed out.
+};
+
+//! Start with @p initial as the settled state: handed out from the first query, no debounce.
+void
+xreal_air_presence_init(struct xreal_air_presence *p, bool initial);
+
+//! A raw display state at @p now_ns, true when it is a real edge.
+bool
+xreal_air_presence_set(struct xreal_air_presence *p, bool on, int64_t now_ns);
+
+//! The presence to hand out: a raw edge once it has held for @p debounce_ns.
+bool
+xreal_air_presence_get(struct xreal_air_presence *p, int64_t now_ns, int64_t debounce_ns);
 
 
 /*

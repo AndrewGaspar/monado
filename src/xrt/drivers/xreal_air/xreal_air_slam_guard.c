@@ -126,6 +126,41 @@ xreal_air_wear_update(struct xreal_air_wear *w, int64_t now_ns, int64_t debounce
 
 /*
  *
+ * User presence.
+ *
+ */
+
+void
+xreal_air_presence_init(struct xreal_air_presence *p, bool initial)
+{
+	p->display_on = initial;
+	p->change_ns = 0;
+	p->reported = initial;
+}
+
+bool
+xreal_air_presence_set(struct xreal_air_presence *p, bool on, int64_t now_ns)
+{
+	if (p->display_on == on) {
+		return false;
+	}
+	p->display_on = on;
+	p->change_ns = now_ns;
+	return true;
+}
+
+bool
+xreal_air_presence_get(struct xreal_air_presence *p, int64_t now_ns, int64_t debounce_ns)
+{
+	if (p->display_on != p->reported && now_ns - p->change_ns >= debounce_ns) {
+		p->reported = p->display_on;
+	}
+	return p->reported;
+}
+
+
+/*
+ *
  * SLAM pose guard.
  *
  */
