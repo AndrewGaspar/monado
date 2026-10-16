@@ -13,6 +13,11 @@ add_library(
 	t_imu.h
 	t_openvr_tracker.cpp
 	t_openvr_tracker.h
+	t_plane_depth.h
+	t_plane_detections.c
+	t_plane_detections.h
+	t_plane_map.cpp
+	t_plane_map.h
 	t_tracking.h
 	)
 target_link_libraries(
@@ -43,6 +48,10 @@ if(XRT_HAVE_OPENCV)
 			t_helper_debug_sink.hpp
 			t_hsv_filter.c
 			t_kalman.cpp
+			t_plane_detector.cpp
+			t_plane_detector.h
+			t_plane_stereo.cpp
+			t_plane_stereo.h
 		)
 	if(XRT_BUILD_DRIVER_PSMV)
 		target_sources(aux_tracking PRIVATE t_tracker_psmv_fusion.hpp t_tracker_psmv.cpp)
