@@ -14,8 +14,13 @@
  * The recording's timestamps are shifted onto the current monotonic clock and played back at 1x
  * with the live arrival latencies, so the stale / warm-up logic sees what it would live.
  *
- * XREAL_SLAM_REPLAY_GAP=<start_s>,<length_s> drops the camera frames in that window to simulate a
- * camera stall (3DoF fallback, Basalt's pipeline gap, re-acquisition).
+ * Simulated trouble, each <start_s>,<length_s> in seconds from the first frame:
+ *  - XREAL_SLAM_REPLAY_GAP    drop the camera frames (a camera stall: 3DoF fallback, re-acquisition).
+ *  - XREAL_SLAM_REPLAY_BLACK  replace the frames with black ones (no features: the tracker goes blind
+ *                             but keeps getting frames, like glasses lying face down).
+ *  - XREAL_SLAM_REPLAY_STILL  freeze the IMU (gravity where it was plus sensor noise, no rotation) and
+ *                             keep showing the last frame, like glasses lying on a desk.
+ *  - XREAL_SLAM_REPLAY_DOFF   report the glasses taken off for the window (display off / on edges).
  *
  * Writes <out_dir>/head_poses.csv (one line per pose query) and, through t_slam's CSV writers,
  * <out_dir>/tracking.csv (raw SLAM poses, Basalt frames, shifted clock).
@@ -46,6 +51,7 @@
 #include "cli_xreal_image.h"
 
 #include <inttypes.h>
+#include <math.h>
 #include <string.h>
 
 #define P(...) fprintf(stderr, __VA_ARGS__)
@@ -202,6 +208,41 @@ load_frame(const char *dir, int cam, const char *name)
 	return xf;
 }
 
+//! A <start_s>,<length_s> window from the environment, inactive when unset.
+struct window
+{
+	double start_s, len_s;
+};
+
+static struct window
+window_from_env(const char *name)
+{
+	struct window w = {-1, 0};
+	const char *v = getenv(name);
+	if (v != NULL && sscanf(v, "%lf,%lf", &w.start_s, &w.len_s) == 2) {
+		P("%s: from %.1f s for %.1f s\n", name, w.start_s, w.len_s);
+	} else {
+		w.start_s = -1;
+		w.len_s = 0;
+	}
+	return w;
+}
+
+static bool
+in_window(const struct window *w, double rel_s)
+{
+	return w->len_s > 0 && rel_s >= w->start_s && rel_s < w->start_s + w->len_s;
+}
+
+//! Gaussian noise, Box-Muller on a fixed-seed generator (repeatable runs).
+static float
+noise(unsigned int *seed, float std)
+{
+	const double u1 = ((double)rand_r(seed) + 1.0) / ((double)RAND_MAX + 2.0);
+	const double u2 = ((double)rand_r(seed) + 1.0) / ((double)RAND_MAX + 2.0);
+	return (float)(sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2)) * std;
+}
+
 static void
 sleep_until(int64_t t)
 {
@@ -283,12 +324,16 @@ cli_cmd_xreal_slam_replay(int argc, const char **argv)
 	const int64_t offset = (int64_t)os_monotonic_get_ns() + 200 * U_TIME_1MS_IN_NS - first;
 	const int64_t end = cams[cam_count - 1].ts + offset + U_TIME_1S_IN_NS;
 
-	// XREAL_SLAM_REPLAY_GAP=<start_s>,<length_s>: drop the camera frames in that window (a stall).
-	double gap_start_s = -1, gap_len_s = 0;
-	const char *gap = getenv("XREAL_SLAM_REPLAY_GAP");
-	if (gap != NULL && sscanf(gap, "%lf,%lf", &gap_start_s, &gap_len_s) == 2) {
-		P("Simulating a camera stall from %.1f s for %.1f s\n", gap_start_s, gap_len_s);
-	}
+	const struct window gap = window_from_env("XREAL_SLAM_REPLAY_GAP");
+	const struct window black = window_from_env("XREAL_SLAM_REPLAY_BLACK");
+	const struct window still = window_from_env("XREAL_SLAM_REPLAY_STILL");
+	const struct window doff = window_from_env("XREAL_SLAM_REPLAY_DOFF");
+	bool doffed = false;
+	unsigned int seed = 1234;
+	struct xrt_vec3 accel_ema = {0, 0, 0}; // Where gravity is, for the frozen IMU.
+	bool was_still = false;
+	struct xrt_vec3 frozen_accel = {0, 0, 0};
+	char frozen_frame[64] = "";
 
 	size_t ii = 0, ci = 0;
 	int64_t next_query = first + offset;
@@ -307,19 +352,51 @@ cli_cmd_xreal_slam_replay(int argc, const char **argv)
 
 		if (t_next == t_imu) {
 			const struct imu_row *r = &imu[ii++];
-			xreal_air_slam_push_imu(s, r->ts + offset, &r->gyro, &r->accel);
+			const double rel_s = (double)(r->ts - cams[0].ts) / 1e9;
+			struct xrt_vec3 gyro = r->gyro, accel = r->accel;
+			if (in_window(&still, rel_s)) {
+				if (!was_still) {
+					frozen_accel = accel_ema;
+					was_still = true;
+				}
+				// The measured sensor noise at 1 kHz (4e-5 rad/s/sqrt(Hz), 6.1e-4 m/s^2/sqrt(Hz)).
+				gyro = (struct xrt_vec3){noise(&seed, 1e-3f), noise(&seed, 1e-3f), noise(&seed, 1e-3f)};
+				accel = (struct xrt_vec3){frozen_accel.x + noise(&seed, 0.014f),
+				                          frozen_accel.y + noise(&seed, 0.014f),
+				                          frozen_accel.z + noise(&seed, 0.014f)};
+			} else {
+				was_still = false;
+				accel_ema.x += 0.02f * (accel.x - accel_ema.x);
+				accel_ema.y += 0.02f * (accel.y - accel_ema.y);
+				accel_ema.z += 0.02f * (accel.z - accel_ema.z);
+			}
+			if (in_window(&doff, rel_s) != doffed) {
+				doffed = !doffed;
+				P("Replay: glasses %s at %.1f s\n", doffed ? "taken off" : "put on", rel_s);
+				xreal_air_slam_set_display_on(s, !doffed);
+			}
+			xreal_air_slam_push_imu(s, r->ts + offset, &gyro, &accel);
 			// The 3DoF fusion runs in the driver's frame (x right, y up, z back).
-			const struct xrt_vec3 g = {r->gyro.x, -r->gyro.y, -r->gyro.z};
-			const struct xrt_vec3 a = {r->accel.x, -r->accel.y, -r->accel.z};
+			const struct xrt_vec3 g = {gyro.x, -gyro.y, -gyro.z};
+			const struct xrt_vec3 a = {accel.x, -accel.y, -accel.z};
 			m_imu_3dof_update(&fusion, (uint64_t)(r->ts + offset), &a, &g);
 		} else if (t_next == t_cam) {
 			const struct cam_row *r = &cams[ci++];
 			const double rel_s = (double)(r->ts - cams[0].ts) / 1e9;
-			if (rel_s >= gap_start_s && rel_s < gap_start_s + gap_len_s) {
+			if (in_window(&gap, rel_s)) {
 				continue; // Simulated camera stall.
 			}
-			struct xrt_frame *l = load_frame(dir, 0, r->name);
-			struct xrt_frame *rt = load_frame(dir, 1, r->name);
+			// Lying on a desk: the view does not change.
+			if (!in_window(&still, rel_s)) {
+				snprintf(frozen_frame, sizeof(frozen_frame), "%s", r->name);
+			}
+			const char *name = frozen_frame[0] != '\0' ? frozen_frame : r->name;
+			struct xrt_frame *l = load_frame(dir, 0, name);
+			struct xrt_frame *rt = load_frame(dir, 1, name);
+			if (l != NULL && rt != NULL && in_window(&black, rel_s)) {
+				memset(l->data, 0, l->size);
+				memset(rt->data, 0, rt->size);
+			}
 			if (l != NULL && rt != NULL) {
 				xreal_air_slam_push_stereo(s, r->ts + offset, r->exposure, l, rt);
 			}
