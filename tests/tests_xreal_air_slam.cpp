@@ -777,8 +777,8 @@ TEST_CASE("xreal_air_slam_guard")
 			frames++;
 		}
 		CHECK(usable);
-		CHECK(frames >= 15); // 500 ms.
-		CHECK(frames <= 17);
+		CHECK(frames >= 8); // 250 ms.
+		CHECK(frames <= 10);
 	}
 }
 

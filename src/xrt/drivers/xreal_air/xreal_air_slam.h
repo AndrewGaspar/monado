@@ -22,8 +22,8 @@
  *                                      the VIT library, else Basalt's built-in defaults.
  *  - XREAL_AIR_SLAM_CAM_OFFSET_US=0    Extra camera time offset on top of mid-exposure stamping.
  *  - XREAL_AIR_SLAM_STALE_MS=300       No new SLAM pose for this long = not tracking (3DoF fallback).
- *  - XREAL_AIR_SLAM_FRESH_MS=200       ... and only tracking again once the newest pose is younger
- *  - XREAL_AIR_SLAM_FRESH_HOLD_MS=500  than this for this long (hysteresis against flapping).
+ *  - XREAL_AIR_SLAM_FRESH_MS=250       ... and only tracking again once the newest pose is younger
+ *  - XREAL_AIR_SLAM_FRESH_HOLD_MS=250  than this for this long (hysteresis against flapping).
  *  - XREAL_AIR_SLAM_WARMUP_MS=1500     Let Basalt settle this long before the output follows it.
  *  - XREAL_AIR_SLAM_WEAR=1             Stop the tracker while the glasses are off (display off, the wear
  *                                      sensor; 3DoF with the position held), start a fresh one when

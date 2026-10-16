@@ -134,8 +134,8 @@ void
 xreal_air_slam_guard_default_config(struct xreal_air_slam_guard_config *cfg)
 {
 	cfg->stale_ns = 300 * NS_PER_MS;
-	cfg->fresh_ns = 200 * NS_PER_MS;
-	cfg->fresh_hold_ns = 500 * NS_PER_MS;
+	cfg->fresh_ns = 250 * NS_PER_MS;
+	cfg->fresh_hold_ns = 250 * NS_PER_MS;
 	cfg->warmup_ns = 1500 * NS_PER_MS;
 	cfg->jump_distance_m = 0.25f;
 	cfg->jump_angle_deg = 25.0f; // Between two 30 Hz poses: 750 deg/s, faster than heads turn.
