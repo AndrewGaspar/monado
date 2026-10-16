@@ -1004,6 +1004,11 @@ xreal_air_set_display_on(struct xreal_air_hmd *hmd, bool on)
 
 	hmd->display_on = on;
 	hmd->display_on_change_ns = (timepoint_ns)os_monotonic_get_ns();
+
+	// The 6DoF tracker cannot see anything useful lying on a desk: it pauses while the glasses are off.
+	if (hmd->slam != NULL) {
+		xreal_air_slam_set_display_on(hmd->slam, on);
+	}
 }
 
 static void

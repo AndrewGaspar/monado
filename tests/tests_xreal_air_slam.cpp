@@ -467,11 +467,11 @@ TEST_CASE("xreal_air_still")
 	unsigned int seed = 7;
 	auto noise = [&](float std) { return std * ((float)rand_r(&seed) / (float)RAND_MAX - 0.5f) * 3.46f; };
 
-	SECTION("Lying on a desk: still after half a second")
+	SECTION("Lying on a desk: still after 0.3 s")
 	{
 		bool still = false;
 		int64_t t = 1000 * MS;
-		for (int i = 0; i < 400; i++, t += MS) {
+		for (int i = 0; i < 250; i++, t += MS) {
 			const xrt_vec3 g = {noise(1e-3f), noise(1e-3f), noise(1e-3f)};
 			const xrt_vec3 a = {0.3f + noise(0.014f), -7.5f + noise(0.014f), 6.3f + noise(0.014f)};
 			still = xreal_air_still_push(&st, t, &g, &a);

@@ -42,8 +42,8 @@ extern "C" {
 
 //! Samples averaged into one block (1 kHz IMU: 10 ms), which takes the sensor noise out.
 #define XREAL_AIR_STILL_BLOCK_SAMPLES 10
-//! Blocks in the window (0.5 s).
-#define XREAL_AIR_STILL_WINDOW_BLOCKS 50
+//! Blocks in the window (0.3 s).
+#define XREAL_AIR_STILL_WINDOW_BLOCKS 30
 
 struct xreal_air_still
 {

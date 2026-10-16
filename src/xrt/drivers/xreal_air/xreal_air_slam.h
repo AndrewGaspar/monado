@@ -22,7 +22,23 @@
  *                                      the VIT library, else Basalt's built-in defaults.
  *  - XREAL_AIR_SLAM_CAM_OFFSET_US=0    Extra camera time offset on top of mid-exposure stamping.
  *  - XREAL_AIR_SLAM_STALE_MS=300       No new SLAM pose for this long = not tracking (3DoF fallback).
+ *  - XREAL_AIR_SLAM_FRESH_MS=200       ... and only tracking again once the newest pose is younger
+ *  - XREAL_AIR_SLAM_FRESH_HOLD_MS=500  than this for this long (hysteresis against flapping).
  *  - XREAL_AIR_SLAM_WARMUP_MS=1500     Let Basalt settle this long before the output follows it.
+ *  - XREAL_AIR_SLAM_WEAR=1             Stop the tracker while the glasses are off (display off, the wear
+ *                                      sensor; 3DoF with the position held), start a fresh one when
+ *                                      they are put on again.
+ *  - XREAL_AIR_SLAM_WEAR_DEBOUNCE_MS=400  How long a wear edge must hold.
+ *  - XREAL_AIR_SLAM_DOFF_LOOKBACK_MS=1000 Hold the position from this long before the glasses were
+ *                                      taken off (the removal itself moved them).
+ *  - XREAL_AIR_SLAM_DIVERGENCE=1       Detect a tracker running away and restart it: faster than
+ *                                      XREAL_AIR_SLAM_MAX_SPEED=3 m/s for 200 ms, or faster than
+ *                                      XREAL_AIR_SLAM_STILL_SPEED=0.1 m/s for 300 ms while the IMU is at
+ *                                      rest, or discontinuities less than 2 s apart. The output stops
+ *                                      following SLAM at the first suspicious pose, and after
+ *                                      a divergence only follows the fresh tracker once the
+ *                                      IMU has seen the head move.
+ *  - XREAL_AIR_SLAM_RESTART_MIN_MS=3000  At most one divergence restart this often.
  *  - XREAL_AIR_SLAM_KB4_STEP_PX=8      Grid step of the fisheye624 -> KB4 fit.
  *  - SLAM_* (SLAM_PREDICTION_TYPE, SLAM_WRITE_CSVS, SLAM_CSV_PATH, SLAM_LOG, ...) as for t_slam.
  *
@@ -64,6 +80,14 @@ xreal_air_slam_create(enum u_logging_level log_level);
  */
 void
 xreal_air_slam_set_calibration(struct xreal_air_slam *s, const struct xreal_air_parsed_calibration *calib);
+
+/*!
+ * The glasses' display went on or off: the wear sensor (proximity). The tracker is stopped once the
+ * glasses have been off for the debounce time, and a fresh one started once they are back on.
+ * Before the first call the glasses count as worn.
+ */
+void
+xreal_air_slam_set_display_on(struct xreal_air_slam *s, bool on);
 
 /*!
  * An IMU sample, factory IMU frame (x right, y down, z forward), host clock. Never blocks, drops
