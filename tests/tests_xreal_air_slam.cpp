@@ -9,13 +9,16 @@
 
 #include "xreal_air/xreal_air_slam_calib.h"
 #include "xreal_air/xreal_air_pose_blend.h"
+#include "xreal_air/xreal_air_slam_guard.h"
 
 #include "math/m_api.h"
 #include "math/m_space.h"
+#include "math/m_vec3.h"
 
 #include "catch_amalgamated.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 using Catch::Approx;
@@ -447,4 +450,391 @@ TEST_CASE("xreal_air_pose_blend")
 			}
 		}
 	}
+}
+
+/*
+ *
+ * Trusting SLAM: IMU stillness, wear state, the pose guard, the position history.
+ *
+ */
+
+static const int64_t MS = 1000000;
+
+TEST_CASE("xreal_air_still")
+{
+	xreal_air_still st;
+	xreal_air_still_init(&st, 0.03f, 0.15f);
+	unsigned int seed = 7;
+	auto noise = [&](float std) { return std * ((float)rand_r(&seed) / (float)RAND_MAX - 0.5f) * 3.46f; };
+
+	SECTION("Lying on a desk: still after half a second")
+	{
+		bool still = false;
+		int64_t t = 1000 * MS;
+		for (int i = 0; i < 400; i++, t += MS) {
+			const xrt_vec3 g = {noise(1e-3f), noise(1e-3f), noise(1e-3f)};
+			const xrt_vec3 a = {0.3f + noise(0.014f), -7.5f + noise(0.014f), 6.3f + noise(0.014f)};
+			still = xreal_air_still_push(&st, t, &g, &a);
+		}
+		CHECK_FALSE(still); // Not a full window yet.
+		for (int i = 0; i < 200; i++, t += MS) {
+			const xrt_vec3 g = {noise(1e-3f), noise(1e-3f), noise(1e-3f)};
+			const xrt_vec3 a = {0.3f + noise(0.014f), -7.5f + noise(0.014f), 6.3f + noise(0.014f)};
+			still = xreal_air_still_push(&st, t, &g, &a);
+		}
+		CHECK(still);
+
+		SECTION("A head turning slowly is not still")
+		{
+			for (int i = 0; i < 100; i++, t += MS) {
+				const xrt_vec3 g = {0, 0.1f, 0};
+				const xrt_vec3 a = {0.3f, -7.5f, 6.3f};
+				still = xreal_air_still_push(&st, t, &g, &a);
+			}
+			CHECK_FALSE(still);
+		}
+
+		SECTION("A gap in the samples starts over")
+		{
+			const xrt_vec3 g = {0, 0, 0};
+			const xrt_vec3 a = {0.3f, -7.5f, 6.3f};
+			for (int i = 0; i < 20; i++) {
+				still = xreal_air_still_push(&st, t + 200 * MS + i * MS, &g, &a);
+			}
+			CHECK_FALSE(still);
+		}
+	}
+
+	SECTION("Worn, nodding a little (accel swings): not still")
+	{
+		bool still = false;
+		int64_t t = 1000 * MS;
+		for (int i = 0; i < 1000; i++, t += MS) {
+			const xrt_vec3 g = {0.01f, 0.01f, 0};
+			const float swing = 0.3f * std::sin((float)i * 2.0f * (float)M_PI / 500.0f);
+			const xrt_vec3 a = {0, -9.8f + swing, 0};
+			still = xreal_air_still_push(&st, t, &g, &a);
+		}
+		CHECK_FALSE(still);
+	}
+}
+
+TEST_CASE("xreal_air_wear")
+{
+	xreal_air_wear w;
+	xreal_air_wear_init(&w);
+	const int64_t debounce = 400 * MS;
+
+	// Nothing known: worn.
+	CHECK_FALSE(xreal_air_wear_update(&w, 1000 * MS, debounce));
+	CHECK(w.worn);
+
+	// The display coming on is no change.
+	xreal_air_wear_raw(&w, true, 1000 * MS);
+	CHECK_FALSE(xreal_air_wear_update(&w, 2000 * MS, debounce));
+	CHECK(w.worn);
+
+	// A flicker shorter than the debounce does nothing.
+	xreal_air_wear_raw(&w, false, 3000 * MS);
+	CHECK_FALSE(xreal_air_wear_update(&w, 3100 * MS, debounce));
+	xreal_air_wear_raw(&w, true, 3200 * MS);
+	CHECK_FALSE(xreal_air_wear_update(&w, 4000 * MS, debounce));
+	CHECK(w.worn);
+
+	// Taken off for good: reported once, after the debounce, with the time of the edge.
+	xreal_air_wear_raw(&w, false, 5000 * MS);
+	CHECK_FALSE(xreal_air_wear_update(&w, 5399 * MS, debounce));
+	CHECK(xreal_air_wear_update(&w, 5400 * MS, debounce));
+	CHECK_FALSE(w.worn);
+	CHECK(w.worn_change_ns == 5000 * MS);
+	CHECK_FALSE(xreal_air_wear_update(&w, 6000 * MS, debounce));
+
+	// Repeated raw edges with the same state do not restart the debounce.
+	xreal_air_wear_raw(&w, true, 7000 * MS);
+	xreal_air_wear_raw(&w, true, 7300 * MS);
+	CHECK(xreal_air_wear_update(&w, 7400 * MS, debounce));
+	CHECK(w.worn);
+}
+
+//! A 30 Hz pose stream fed to a guard, with the pose query at a fixed latency after each pose.
+struct guard_feed
+{
+	xreal_air_slam_guard g;
+	int64_t t = 10000 * MS;
+	xrt_pose pose = {{0, 0, 0, 1}, {0, 0, 0}};
+	xrt_vec3 vel = {0, 0, 0};
+	int64_t lag = 60 * MS;
+
+	guard_feed()
+	{
+		xreal_air_slam_guard_config cfg;
+		xreal_air_slam_guard_default_config(&cfg);
+		xreal_air_slam_guard_init(&g, &cfg);
+	}
+
+	//! One frame later, moved by the velocity; returns the verdict, @p usable what the output may do.
+	xreal_air_slam_pose_verdict
+	step(bool imu_still, bool *usable = nullptr, int64_t dt = 33333333)
+	{
+		t += dt;
+		const float s = (float)dt * 1e-9f;
+		pose.position = {pose.position.x + vel.x * s, pose.position.y + vel.y * s, pose.position.z + vel.z * s};
+		const xreal_air_slam_pose_verdict v = xreal_air_slam_guard_push(&g, t, &pose, &vel, imu_still);
+		const bool u = xreal_air_slam_guard_usable(&g, t + lag, t);
+		if (usable != nullptr) {
+			*usable = u;
+		}
+		return v;
+	}
+
+	//! Steps until usable (at most 5 s), true if it got there.
+	bool
+	settle()
+	{
+		for (int i = 0; i < 150; i++) {
+			bool u = false;
+			step(false, &u);
+			if (u) {
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+TEST_CASE("xreal_air_slam_guard")
+{
+	guard_feed f;
+
+	SECTION("A clean stream: warm-up, then usable, everything ok")
+	{
+		bool usable = true;
+		CHECK(f.step(false, &usable) == XREAL_AIR_SLAM_POSE_FIRST);
+		CHECK_FALSE(usable);
+		f.vel = {0.5f, 0, 0}; // Walking pace.
+		int first_usable = -1;
+		for (int i = 0; i < 90; i++) {
+			CHECK(f.step(false, &usable) == XREAL_AIR_SLAM_POSE_OK);
+			if (usable && first_usable < 0) {
+				first_usable = i;
+			}
+		}
+		// 1.5 s warm-up at 30 Hz.
+		CHECK(first_usable >= 44);
+		CHECK(first_usable <= 46);
+		CHECK(usable);
+	}
+
+	REQUIRE(f.settle());
+	const uint32_t world = f.g.world_id;
+
+	SECTION("The same pose again is not news")
+	{
+		CHECK(xreal_air_slam_guard_push(&f.g, f.t, &f.pose, &f.vel, false) == XREAL_AIR_SLAM_POSE_SAME);
+	}
+
+	SECTION("A stall: same world, warm-up again")
+	{
+		bool usable = true;
+		CHECK(f.step(false, &usable, 2000 * MS) == XREAL_AIR_SLAM_POSE_RESUMED);
+		CHECK_FALSE(usable);
+		CHECK(f.g.world_id == world);
+		CHECK(f.settle());
+	}
+
+	SECTION("One discontinuity is a re-initialisation: a new world, warm-up, then usable")
+	{
+		f.pose.position.x += 3.0f;
+		bool usable = true;
+		CHECK(f.step(false, &usable) == XREAL_AIR_SLAM_POSE_REINIT);
+		CHECK_FALSE(usable);
+		CHECK(f.g.world_id == world + 1);
+		CHECK(f.settle());
+
+		SECTION("Another one much later is another re-initialisation")
+		{
+			for (int i = 0; i < 90; i++) {
+				f.step(false);
+			}
+			f.pose.position.y += 1.0f;
+			CHECK(f.step(false) == XREAL_AIR_SLAM_POSE_REINIT);
+			CHECK(f.g.world_id == world + 2);
+		}
+	}
+
+	SECTION("The live runaway: a jump every frame is a divergence, not a re-initialisation per frame")
+	{
+		// 2026-10-15 20:49: "pose jumped 0.25 m" (and more) on every 30 Hz pose for 7 minutes.
+		f.vel = {9.0f, 0, 0};
+		bool usable = true;
+		CHECK(f.step(false, &usable) == XREAL_AIR_SLAM_POSE_REINIT);
+		CHECK_FALSE(usable);
+		CHECK(f.step(false, &usable) == XREAL_AIR_SLAM_POSE_DIVERGED);
+		CHECK_FALSE(usable);
+		for (int i = 0; i < 100; i++) {
+			CHECK(f.step(false, &usable) == XREAL_AIR_SLAM_POSE_DIVERGED); // Latched.
+			CHECK_FALSE(usable);
+		}
+		CHECK(f.g.world_id == world + 1); // Not one world per frame.
+
+		SECTION("A restart clears it, the next pose starts a new world")
+		{
+			xreal_air_slam_guard_restart(&f.g);
+			f.vel = {0, 0, 0};
+			f.pose.position = {0, 0, 0};
+			CHECK(f.step(false) == XREAL_AIR_SLAM_POSE_FIRST);
+			CHECK(f.g.world_id == world + 2);
+			CHECK(f.settle());
+		}
+	}
+
+	SECTION("Drifting away while the IMU is at rest (the glasses on the desk): never followed")
+	{
+		// Constant acceleration from rest, 0.56 m/s^2 as the live log's step sizes grew.
+		const xrt_vec3 start = f.pose.position;
+		bool usable = true;
+		bool followed_far = false;
+		xreal_air_slam_pose_verdict v = XREAL_AIR_SLAM_POSE_OK;
+		float drift_when_held = -1;
+		int frames = 0;
+		while (v != XREAL_AIR_SLAM_POSE_DIVERGED && frames < 300) {
+			f.vel.y += 0.56f / 30.0f;
+			v = f.step(true, &usable);
+			const float drift = m_vec3_len(m_vec3_sub(f.pose.position, start));
+			if (!usable && drift_when_held < 0) {
+				drift_when_held = drift;
+			}
+			if (usable && drift > 0.1f) {
+				followed_far = true;
+			}
+			frames++;
+		}
+		CHECK(v == XREAL_AIR_SLAM_POSE_DIVERGED);
+		CHECK_FALSE(followed_far);
+		// The output let go at 0.1 m/s, ~1 cm of drift in; diverged 0.3 s later.
+		CHECK(drift_when_held < 0.015f);
+		CHECK(frames < 20);
+		CHECK(f.g.suspect_since_ts > 0);
+	}
+
+	SECTION("The same speed while the IMU says the head moves is fine")
+	{
+		f.vel = {0, 0.5f, 0};
+		for (int i = 0; i < 60; i++) {
+			bool usable = false;
+			CHECK(f.step(false, &usable) == XREAL_AIR_SLAM_POSE_OK);
+			CHECK(usable);
+		}
+	}
+
+	SECTION("A short burst of speed is only suspicious, then usable again")
+	{
+		f.vel = {4.0f, 0, 0};
+		bool usable = true;
+		CHECK(f.step(false, &usable) == XREAL_AIR_SLAM_POSE_SUSPECT);
+		CHECK_FALSE(usable);
+		CHECK(f.step(false, &usable) == XREAL_AIR_SLAM_POSE_SUSPECT);
+		f.vel = {0.5f, 0, 0};
+		CHECK(f.step(false, &usable) == XREAL_AIR_SLAM_POSE_OK);
+		CHECK(usable);
+	}
+
+	SECTION("Faster than a head for 200 ms: diverged")
+	{
+		f.vel = {4.0f, 0, 0};
+		xreal_air_slam_pose_verdict v = XREAL_AIR_SLAM_POSE_OK;
+		int frames = 0;
+		while (v != XREAL_AIR_SLAM_POSE_DIVERGED && frames < 30) {
+			v = f.step(false);
+			frames++;
+		}
+		CHECK(v == XREAL_AIR_SLAM_POSE_DIVERGED);
+		CHECK(frames == 8); // 7 frame intervals = 233 ms >= 200 ms.
+	}
+
+	SECTION("Latency hovering around the stale limit does not flap")
+	{
+		// The 2026-10-15 20:38 flapping: lost / acquired every few frames.
+		int changes = 0;
+		bool was = true;
+		for (int i = 0; i < 300; i++) {
+			f.lag = (i % 4 < 2 ? 280 : 320) * MS;
+			bool usable = false;
+			f.step(false, &usable);
+			if (usable != was) {
+				changes++;
+				was = usable;
+			}
+		}
+		CHECK(changes == 1); // Lost once, and not back while the lag stays above the fresh limit.
+
+		// Back to a low latency: usable again after the hold time.
+		f.lag = 60 * MS;
+		int frames = 0;
+		bool usable = false;
+		while (!usable && frames < 100) {
+			f.step(false, &usable);
+			frames++;
+		}
+		CHECK(usable);
+		CHECK(frames >= 15); // 500 ms.
+		CHECK(frames <= 17);
+	}
+}
+
+TEST_CASE("xreal_air_pos_history")
+{
+	xreal_air_pos_history h;
+	xreal_air_pos_history_init(&h, 25 * MS);
+	xrt_vec3 p = {9, 9, 9};
+	CHECK_FALSE(xreal_air_pos_history_at(&h, 0, &p));
+
+	// 11 ms queries, kept every 25 ms or more (so every third, 33 ms), over 5 s: the ring holds the
+	// last 4.2 s.
+	for (int i = 0; i <= 455; i++) {
+		const xrt_vec3 pos = {(float)i, 0, 0};
+		xreal_air_pos_history_push(&h, 1000 * MS + i * 11 * MS, &pos);
+	}
+	REQUIRE(xreal_air_pos_history_at(&h, 1000 * MS + 4000 * MS, &p));
+	CHECK(p.x == Approx(362).margin(3)); // The newest kept at or before 4 s in (query 363, 3993 ms).
+	REQUIRE(xreal_air_pos_history_at(&h, 1000 * MS + 5005 * MS, &p));
+	CHECK(p.x >= 453.0f);
+	// Older than everything kept: the oldest.
+	REQUIRE(xreal_air_pos_history_at(&h, 0, &p));
+	CHECK(p.x > 60.0f);
+	CHECK(p.x < 80.0f);
+}
+
+TEST_CASE("xreal_air_pose_blend_hold")
+{
+	const int64_t s = 1000000000;
+	xreal_air_pose_blend b;
+	xreal_air_pose_blend_init(&b);
+	xrt_space_relation out;
+	const xrt_quat fusion_q = axis_angle(0, 1, 0, 20);
+	xrt_space_relation fusion = orientation_relation(fusion_q);
+
+	// Tracking, the head 0.4 m down from where it started (the glasses on their way to the desk).
+	const xrt_quat slam_q = axis_angle(0, 1, 0, -70);
+	xrt_space_relation slam = pose_relation(slam_q, {0, 0, 0});
+	xreal_air_pose_blend_update(&b, 10 * s, &slam, 1, &fusion, &out);
+	xrt_space_relation lowered = pose_relation(slam_q, {0, -0.4f, 0});
+	xreal_air_pose_blend_update(&b, 12 * s, &lowered, 1, &fusion, &out);
+	CHECK(out.pose.position.y == Approx(-0.4).margin(1e-3));
+	const xrt_quat before = out.pose.orientation;
+
+	// Hold where the head was before.
+	const xrt_vec3 head = {0, 0, 0};
+	xreal_air_pose_blend_hold(&b, 12 * s + 1000, &fusion, &head);
+	CHECK_FALSE(b.slam_active);
+	xreal_air_pose_blend_update(&b, 12 * s + 2000, NULL, 1, &fusion, &out);
+	CHECK(out.pose.position.y == Approx(0).margin(1e-5));
+	CHECK(quat_angle_deg(out.pose.orientation, before) < 0.05f);
+
+	// A fresh tracker (new world) later anchors there, without a jump.
+	xrt_space_relation fresh = pose_relation(axis_angle(0, 1, 0, 33), {2, 2, 2});
+	xreal_air_pose_blend_update(&b, 30 * s, &fresh, 2, &fusion, &out);
+	CHECK(out.pose.position.x == Approx(0).margin(1e-4));
+	CHECK(out.pose.position.y == Approx(0).margin(1e-4));
+	CHECK(out.pose.position.z == Approx(0).margin(1e-4));
 }

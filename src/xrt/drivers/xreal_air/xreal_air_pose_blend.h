@@ -95,6 +95,17 @@ xreal_air_pose_blend_update(struct xreal_air_pose_blend *b,
                             struct xrt_space_relation *out);
 
 /*!
+ * Stop following SLAM now (as if it was lost) and hold @p position from here on, for when the
+ * output's recent positions are not to be trusted (the glasses were being taken off, or SLAM was
+ * running away). The orientation stays continuous. The next SLAM acquisition anchors there.
+ */
+void
+xreal_air_pose_blend_hold(struct xreal_air_pose_blend *b,
+                          int64_t at_ns,
+                          const struct xrt_space_relation *fusion,
+                          const struct xrt_vec3 *position);
+
+/*!
  * The rotation about +Y (yaw) part of @p q, as a quaternion.
  */
 void

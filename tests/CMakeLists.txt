@@ -157,6 +157,7 @@ if(XRT_BUILD_DRIVER_XREAL_AIR)
 		tests_xreal_air_slam
 		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/xreal_air/xreal_air_slam_calib.c
 			${PROJECT_SOURCE_DIR}/src/xrt/drivers/xreal_air/xreal_air_pose_blend.c
+			${PROJECT_SOURCE_DIR}/src/xrt/drivers/xreal_air/xreal_air_slam_guard.c
 		)
 	target_include_directories(tests_xreal_air_slam PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers)
 	target_link_libraries(tests_xreal_air_slam PRIVATE aux_math xrt-interfaces)

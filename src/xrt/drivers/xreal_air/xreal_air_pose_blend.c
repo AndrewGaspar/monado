@@ -135,6 +135,32 @@ acquire(struct xreal_air_pose_blend *b,
 	b->slam_acquired++;
 }
 
+//! Lost: keep the orientation where SLAM left it, hold the position.
+static void
+lose(struct xreal_air_pose_blend *b, int64_t at_ns, const struct xrt_quat *fusion_q)
+{
+	b->held_position = b->last_out.position;
+	correction_between(&b->last_out.orientation, fusion_q, &b->fusion_full);
+	xreal_air_pose_blend_yaw_of(&b->fusion_full, &b->fusion_yaw);
+	b->fusion_switch_ns = at_ns;
+	b->slam_active = false;
+	b->slam_lost++;
+}
+
+void
+xreal_air_pose_blend_hold(struct xreal_air_pose_blend *b,
+                          int64_t at_ns,
+                          const struct xrt_space_relation *fusion,
+                          const struct xrt_vec3 *position)
+{
+	if (b->slam_active) {
+		struct xrt_quat fusion_q = fusion->pose.orientation;
+		math_quat_normalize(&fusion_q);
+		lose(b, at_ns, &fusion_q);
+	}
+	b->held_position = *position;
+}
+
 void
 xreal_air_pose_blend_update(struct xreal_air_pose_blend *b,
                             int64_t at_ns,
@@ -174,13 +200,7 @@ xreal_air_pose_blend_update(struct xreal_air_pose_blend *b,
 	}
 
 	if (b->slam_active) {
-		// Lost: keep the orientation where SLAM left it, hold the position.
-		b->held_position = b->last_out.position;
-		correction_between(&b->last_out.orientation, &fusion_q, &b->fusion_full);
-		xreal_air_pose_blend_yaw_of(&b->fusion_full, &b->fusion_yaw);
-		b->fusion_switch_ns = at_ns;
-		b->slam_active = false;
-		b->slam_lost++;
+		lose(b, at_ns, &fusion_q);
 	}
 
 	struct xrt_quat correction;

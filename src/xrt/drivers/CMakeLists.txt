@@ -153,6 +153,8 @@ if(XRT_BUILD_DRIVER_XREAL_AIR)
 			xreal_air/xreal_air_slam_calib.c
 			xreal_air/xreal_air_pose_blend.h
 			xreal_air/xreal_air_pose_blend.c
+			xreal_air/xreal_air_slam_guard.h
+			xreal_air/xreal_air_slam_guard.c
 		)
 	target_link_libraries(drv_xreal_air PRIVATE aux_math aux_os aux_tracking xrt-external-stb)
 	if(ZLIB_FOUND)
