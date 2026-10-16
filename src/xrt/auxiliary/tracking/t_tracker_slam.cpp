@@ -1428,6 +1428,18 @@ t_slam_get_latest_pose(struct xrt_tracked_slam *xts, timepoint_ns *out_ts, struc
 	return true;
 }
 
+extern "C" int
+t_slam_reset(struct xrt_tracked_slam *xts)
+{
+	auto &t = *container_of(xts, TrackerSlam, base);
+	vit_result_t vres = t.vit.tracker_reset(t.tracker);
+	if (vres != VIT_SUCCESS) {
+		SLAM_WARN("Failed to reset VIT tracker");
+		return -1;
+	}
+	return 0;
+}
+
 extern "C" void
 t_slam_fill_default_config(struct t_slam_tracker_config *config)
 {

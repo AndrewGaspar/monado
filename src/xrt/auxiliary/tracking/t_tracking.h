@@ -713,6 +713,16 @@ t_slam_start(struct xrt_tracked_slam *xts);
 bool
 t_slam_get_latest_pose(struct xrt_tracked_slam *xts, timepoint_ns *out_ts, struct xrt_space_relation *out_relation);
 
+/*!
+ * Ask the SLAM system to reset its state (VIT tracker_reset): it forgets its map and starts a new
+ * world with one of the next frames. Cheap, does not block.
+ *
+ * @return 0 on success.
+ * @public @memberof xrt_tracked_slam
+ */
+int
+t_slam_reset(struct xrt_tracked_slam *xts);
+
 /*
  *
  * Camera calibration
