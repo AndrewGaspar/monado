@@ -203,6 +203,46 @@ xreal_air_kb4_project_angles(const struct xreal_air_kb4 *kb4, double theta, doub
 	kb4_eval(x, theta, phi, out_uv, NULL);
 }
 
+bool
+xreal_air_kb4_unproject(const struct xreal_air_kb4 *kb4, const double uv[2], double out_ray[3])
+{
+	const double mx = (uv[0] - kb4->cx) / kb4->fx;
+	const double my = (uv[1] - kb4->cy) / kb4->fy;
+	const double r = sqrt(mx * mx + my * my);
+	if (r < 1e-12) {
+		out_ray[0] = 0;
+		out_ray[1] = 0;
+		out_ray[2] = 1;
+		return true;
+	}
+
+	// Newton on d(theta) = theta (1 + k1 theta^2 + k2 theta^4 + k3 theta^6 + k4 theta^8) = r.
+	double th = r;
+	for (int i = 0; i < 20; i++) {
+		const double t2 = th * th;
+		const double poly = 1 + t2 * (kb4->k[0] + t2 * (kb4->k[1] + t2 * (kb4->k[2] + t2 * kb4->k[3])));
+		const double dpoly =
+		    1 + t2 * (3 * kb4->k[0] + t2 * (5 * kb4->k[1] + t2 * (7 * kb4->k[2] + t2 * 9 * kb4->k[3])));
+		if (fabs(dpoly) < 1e-9) {
+			return false;
+		}
+		const double step = (th * poly - r) / dpoly;
+		th -= step;
+		if (fabs(step) < 1e-10) {
+			break;
+		}
+	}
+	if (!(th >= 0.0) || th > M_PI * 0.6) {
+		return false;
+	}
+
+	const double s = sin(th);
+	out_ray[0] = s * mx / r;
+	out_ray[1] = s * my / r;
+	out_ray[2] = cos(th);
+	return true;
+}
+
 //! Solve A x = b for an n x n system (n <= KB4_PARAMS) by Gaussian elimination with partial pivoting.
 static bool
 solve_linear(int n, double A[KB4_PARAMS][KB4_PARAMS], double b[KB4_PARAMS], double out[KB4_PARAMS])

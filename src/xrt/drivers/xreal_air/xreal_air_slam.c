@@ -103,6 +103,35 @@ xreal_air_slam_destroy(struct xreal_air_slam **s_ptr)
 	*s_ptr = NULL;
 }
 
+bool
+xreal_air_slam_planes_enabled(struct xreal_air_slam *s)
+{
+	(void)s;
+	return false;
+}
+
+uint32_t
+xreal_air_slam_get_planes(struct xreal_air_slam *s, struct xreal_air_plane *out, uint32_t max)
+{
+	(void)s;
+	(void)out;
+	(void)max;
+	return 0;
+}
+
+uint32_t
+xreal_air_slam_get_planes_debug(struct xreal_air_slam *s,
+                                struct t_plane *out,
+                                uint32_t max,
+                                struct t_plane_detector_stats *out_stats)
+{
+	(void)s;
+	(void)out;
+	(void)max;
+	(void)out_stats;
+	return 0;
+}
+
 #else // XRT_FEATURE_SLAM
 
 #include "os/os_threading.h"
@@ -112,6 +141,8 @@ xreal_air_slam_destroy(struct xreal_air_slam **s_ptr)
 #include "util/u_var.h"
 
 #include "math/m_vec3.h"
+#include "tracking/t_plane_detector.h"
+#include "tracking/t_plane_stereo.h"
 #include "xreal_air_slam_guard.h"
 
 #include <dlfcn.h>
@@ -138,6 +169,14 @@ DEBUG_GET_ONCE_FLOAT_OPTION(xreal_air_slam_max_speed, "XREAL_AIR_SLAM_MAX_SPEED"
 DEBUG_GET_ONCE_FLOAT_OPTION(xreal_air_slam_still_speed, "XREAL_AIR_SLAM_STILL_SPEED", 0.10f)
 DEBUG_GET_ONCE_NUM_OPTION(xreal_air_slam_restart_min_ms, "XREAL_AIR_SLAM_RESTART_MIN_MS", 3000)
 DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_slam_recreate, "XREAL_AIR_SLAM_RECREATE", true)
+DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_planes, "XREAL_AIR_PLANES", false)
+DEBUG_GET_ONCE_FLOAT_OPTION(xreal_air_planes_hz, "XREAL_AIR_PLANES_HZ", 4.0f)
+DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_planes_landmarks, "XREAL_AIR_PLANES_LANDMARKS", false)
+DEBUG_GET_ONCE_NUM_OPTION(xreal_air_planes_stable_ms, "XREAL_AIR_PLANES_STABLE_MS", 5000)
+DEBUG_GET_ONCE_FLOAT_OPTION(xreal_air_planes_max_sigma_cm, "XREAL_AIR_PLANES_MAX_SIGMA_CM", 3.0f)
+DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_planes_upper_mode, "XREAL_AIR_PLANES_UPPER_MODE", false)
+DEBUG_GET_ONCE_NUM_OPTION(xreal_air_planes_near_cm, "XREAL_AIR_PLANES_NEAR_CM", 60)
+DEBUG_GET_ONCE_OPTION(xreal_air_planes_dump, "XREAL_AIR_PLANES_DUMP", NULL)
 
 #define SLAM_INFO(s, ...) U_LOG_IFL_I((s)->log_level, "Xreal Air SLAM: " __VA_ARGS__)
 // Lifecycle lines at WARN so they show at the driver's default log level.
@@ -186,6 +225,17 @@ DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_slam_recreate, "XREAL_AIR_SLAM_RECREATE", t
 
 //! Output positions kept for looking back (every 25 ms, 128 of them: 3.2 s).
 #define POS_HISTORY_INTERVAL_NS ((int64_t)25 * U_TIME_1MS_IN_NS)
+
+//! Each landmark goes into the plane map at most this often (Basalt reports it with every pose).
+#define PLANES_LANDMARK_INTERVAL_NS ((int64_t)500 * U_TIME_1MS_IN_NS)
+//! Size of the landmark throttle table (a hash by id, collisions only cost an extra point).
+#define PLANES_LANDMARK_SLOTS 4096
+//! Landmark depth uncertainty for the height weights, pixels of disparity-equivalent.
+#define PLANES_LANDMARK_SIGMA_PX 0.3
+//! Landmarks farther than this are not used.
+#define PLANES_LANDMARK_MAX_DIST_M 6.0
+//! Most planes reported.
+#define PLANES_MAX 64
 
 //! A log line that may repeat at most every @ref LOG_INTERVAL_NS, counting what it swallowed.
 struct rate_limit
@@ -281,6 +331,27 @@ struct xreal_air_slam
 	int64_t last_frame_ts;
 	int64_t cam_offset_ns;
 
+	/*!
+	 * Plane detection (XREAL_AIR_PLANES=1). The detector is created with the calibration on the
+	 * tracker thread and lives until destroy (atomic pointer). Its pose callback takes @ref lock.
+	 */
+	bool planes_requested;
+	struct t_plane_detector *planes;
+	struct xreal_air_kb4 kb4[XREAL_AIR_SLAM_CAMERA_COUNT]; //!< For the landmarks (Basalt's model).
+	double f624[XREAL_AIR_SLAM_CAMERA_COUNT][16];          //!< For the dense stereo (factory).
+	struct xrt_pose T_imu_cam[XREAL_AIR_SLAM_CAMERA_COUNT];
+	float baseline_m;
+	//! Under @ref lock: the SLAM world the guard is in and the first pose time of it.
+	uint32_t planes_world_seen;
+	int64_t planes_world_start_ts;
+	//! Under @ref lock (the features callback runs inside the pose queries): last time each
+	//! landmark went into the map.
+	struct
+	{
+		int64_t id;
+		int64_t ts;
+	} *landmark_seen;
+
 	// Settings.
 	bool use_wear;
 	bool allow_recreate;
@@ -366,7 +437,17 @@ fill_slam_calibration(struct xreal_air_slam *s, const struct xreal_air_parsed_ca
 		    .position = {(float)p[0], (float)p[1], (float)p[2]},
 		};
 		math_matrix_4x4_isometry_from_pose(&pose, &sc->T_imu_cam);
+
+		// For the plane detection: Basalt's model (landmarks) and the factory one (dense stereo).
+		s->kb4[i] = kb4;
+		s->T_imu_cam[i] = pose;
+		const double p16[16] = {cam->fc[0], cam->fc[1], cam->cc[0], cam->cc[1]};
+		memcpy(s->f624[i], p16, sizeof(p16));
+		for (int k = 0; k < 12 && k < cam->kc_count; k++) {
+			s->f624[i][4 + k] = cam->kc[k];
+		}
 	}
+	s->baseline_m = m_vec3_len(m_vec3_sub(s->T_imu_cam[1].position, s->T_imu_cam[0].position));
 	c->cam_count = XREAL_AIR_SLAM_CAMERA_COUNT;
 
 	// The samples handed over are already factory calibrated: identity transform, zero offset.
@@ -409,6 +490,170 @@ resolve_config_path(struct xreal_air_slam *s, const char *vit_library)
 	}
 }
 
+
+
+/*
+ *
+ * Plane detection.
+ *
+ */
+
+static struct t_plane_detector *
+planes_get(struct xreal_air_slam *s)
+{
+	return __atomic_load_n(&s->planes, __ATOMIC_ACQUIRE);
+}
+
+static bool
+planes_project_f624(void *user, const double p_cam[3], double out_uv[2])
+{
+	if (p_cam[2] <= 1e-3) {
+		return false;
+	}
+	xreal_air_fisheye624_project((const double *)user, p_cam, out_uv);
+	return true;
+}
+
+/*!
+ * The detector's pose callback, on its thread: the SLAM pose at @p ts, only while the output follows
+ * SLAM, only once the guard has vetted the poses up to @p ts, and only from the current world.
+ */
+static enum t_plane_pose_status
+planes_pose_cb(void *user, int64_t ts, uint32_t *out_world_id, struct xrt_pose *out_T_world_imu)
+{
+	struct xreal_air_slam *s = (struct xreal_air_slam *)user;
+	enum t_plane_pose_status status = T_PLANE_POSE_UNUSABLE;
+
+	os_mutex_lock(&s->lock);
+	if (!s->ready || s->xts == NULL || !s->tracking || ts < __atomic_load_n(&s->gate_ts, __ATOMIC_ACQUIRE) ||
+	    ts < s->planes_world_start_ts || s->planes_world_seen != s->guard.world_id) {
+		goto out;
+	}
+	if (!s->guard.have_pose || ts > s->guard.last_ts) {
+		status = T_PLANE_POSE_NOT_YET;
+		goto out;
+	}
+	struct xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
+	if (!t_slam_get_slam_pose_at(s->xts, ts, &rel)) {
+		goto out; // Older than the history.
+	}
+	*out_T_world_imu = rel.pose;
+	*out_world_id = s->guard.world_id;
+	status = T_PLANE_POSE_READY;
+
+out:
+	os_mutex_unlock(&s->lock);
+	return status;
+}
+
+/*!
+ * Basalt's landmarks of a new pose (VIT pose features), from inside the pose queries (so with
+ * @ref xreal_air_slam::lock held): unproject with the KB4 model Basalt was given, throttle per
+ * landmark, queue for the detector.
+ */
+static void
+planes_features_cb(
+    void *user, timepoint_ns ts, uint32_t cam_index, const struct t_slam_feature *features, uint32_t count)
+{
+	struct xreal_air_slam *s = (struct xreal_air_slam *)user;
+	struct t_plane_detector *d = planes_get(s);
+	if (d == NULL || cam_index >= XREAL_AIR_SLAM_CAMERA_COUNT || s->landmark_seen == NULL) {
+		return;
+	}
+
+	struct t_plane_body_point pts[256];
+	uint32_t n = 0;
+	const struct xreal_air_kb4 *kb4 = &s->kb4[cam_index];
+	const struct xrt_pose *T_imu_cam = &s->T_imu_cam[cam_index];
+	const double fb = kb4->fx * (double)s->baseline_m;
+	for (uint32_t i = 0; i < count; i++) {
+		const struct t_slam_feature *f = &features[i];
+		if (!(f->inv_depth > 1.0f / PLANES_LANDMARK_MAX_DIST_M)) {
+			continue;
+		}
+		const uint32_t slot = (uint32_t)((uint64_t)f->id * 2654435761u) % PLANES_LANDMARK_SLOTS;
+		if (s->landmark_seen[slot].id == f->id &&
+		    ts - s->landmark_seen[slot].ts < PLANES_LANDMARK_INTERVAL_NS) {
+			continue;
+		}
+		const double uv[2] = {f->u, f->v};
+		double ray[3];
+		if (!xreal_air_kb4_unproject(kb4, uv, ray)) {
+			continue;
+		}
+		s->landmark_seen[slot].id = f->id;
+		s->landmark_seen[slot].ts = ts;
+
+		const double dist = 1.0 / f->inv_depth;
+		const struct xrt_vec3 p_cam = {(float)(ray[0] * dist), (float)(ray[1] * dist), (float)(ray[2] * dist)};
+		math_pose_transform_point(T_imu_cam, &p_cam, &pts[n].p_imu);
+		pts[n].rel_sigma = fb > 0 ? (float)(dist * PLANES_LANDMARK_SIGMA_PX / fb) : 1.0f;
+		if (++n == ARRAY_SIZE(pts)) {
+			t_plane_detector_push_points(d, ts, pts, n);
+			n = 0;
+		}
+	}
+	t_plane_detector_push_points(d, ts, pts, n);
+}
+
+//! On the tracker thread once the calibration is converted: start the detector if asked for.
+static void
+planes_create(struct xreal_air_slam *s)
+{
+	if (!s->planes_requested || planes_get(s) != NULL) {
+		return;
+	}
+
+	struct t_plane_detector_config cfg;
+	t_plane_detector_default_config(&cfg);
+	cfg.rate_hz = debug_get_float_option_xreal_air_planes_hz();
+	cfg.map.stable_ns = (int64_t)debug_get_num_option_xreal_air_planes_stable_ms() * U_TIME_1MS_IN_NS;
+	cfg.map.max_sigma_h_m = debug_get_float_option_xreal_air_planes_max_sigma_cm() / 100.0f;
+	cfg.map.upper_mode = debug_get_bool_option_xreal_air_planes_upper_mode();
+	cfg.map.near_m = (float)debug_get_num_option_xreal_air_planes_near_cm() / 100.0f;
+	cfg.dump_path = debug_get_option_xreal_air_planes_dump();
+
+	struct t_plane_stereo_camera cams[XREAL_AIR_SLAM_CAMERA_COUNT];
+	for (int i = 0; i < XREAL_AIR_SLAM_CAMERA_COUNT; i++) {
+		cams[i] = (struct t_plane_stereo_camera){
+		    .project = planes_project_f624,
+		    .user = s->f624[i],
+		    .T_imu_cam = s->T_imu_cam[i],
+		    .width = s->calib.slam_camera[i].resolution[0],
+		    .height = s->calib.slam_camera[i].resolution[1],
+		};
+	}
+
+	s->landmark_seen = calloc(PLANES_LANDMARK_SLOTS, sizeof(*s->landmark_seen));
+	const timepoint_ns t0 = os_monotonic_get_ns();
+	struct t_plane_depth_source *depth = NULL;
+	if (cfg.rate_hz > 0) {
+		struct t_plane_stereo_config stereo;
+		t_plane_stereo_default_config(&stereo);
+		if (t_plane_stereo_create_depth_source(&stereo, cams, &depth) != 0) {
+			SLAM_ERROR(s, "Could not set up the dense stereo, planes from landmarks only");
+		}
+	}
+	struct t_plane_detector *d = NULL;
+	if (t_plane_detector_create(&cfg, depth, planes_pose_cb, s, &d) != 0) {
+		SLAM_ERROR(s, "Could not create the plane detector, no planes");
+		return;
+	}
+	__atomic_store_n(&s->planes, d, __ATOMIC_RELEASE);
+	SLAM_NOTE(s, "Plane detection on (XREAL_AIR_PLANES=1): %s%s, reported after %.1f s stable, set up in %.0f ms",
+	          depth != NULL ? "dense stereo (SGBM, fisheye624 rectification)" : "no dense stereo",
+	          debug_get_bool_option_xreal_air_planes_landmarks() ? " + landmarks" : "",
+	          (double)cfg.map.stable_ns / U_TIME_1S_IN_NS, (double)(os_monotonic_get_ns() - t0) / U_TIME_1MS_IN_NS);
+}
+
+static void
+planes_reset(struct xreal_air_slam *s)
+{
+	struct t_plane_detector *d = planes_get(s);
+	if (d != NULL) {
+		t_plane_detector_reset(d);
+	}
+}
 
 
 /*
@@ -510,6 +755,11 @@ create_tracker(struct xreal_air_slam *s, struct xrt_slam_sinks **out_sinks)
 	}
 	s->stats.last_create_ms = (float)((double)(os_monotonic_get_ns() - t0) / U_TIME_1MS_IN_NS);
 
+	if (planes_get(s) != NULL && debug_get_bool_option_xreal_air_planes_landmarks() &&
+	    t_slam_set_features_callback(xts, planes_features_cb, s) != 0) {
+		SLAM_ERROR(s, "The VIT library cannot report landmarks, planes from dense stereo only");
+	}
+
 	// t_slam unloads the VIT library with each tracker; keep it loaded so restarts do not reload it.
 	bool first = false;
 	bool recreate = false;
@@ -574,6 +824,9 @@ restart_tracker(struct xreal_air_slam *s, bool want, const char *reason, struct 
 		s->stats.last_teardown_ms = teardown_ms;
 	}
 
+	// The map belongs to the old tracker's world.
+	planes_reset(s);
+
 	if (!want) {
 		if (xfctx != NULL) {
 			SLAM_NOTE(s, "Tracker stopped (%s) in %.0f ms", reason, teardown_ms);
@@ -615,6 +868,8 @@ tracker_thread(void *ptr)
 			const bool ok = fill_slam_calibration(s, &calib);
 			if (!ok) {
 				mark_failed(s);
+			} else {
+				planes_create(s);
 			}
 
 			os_thread_helper_lock(&s->oth);
@@ -685,6 +940,7 @@ reset_in_place_locked(struct xreal_air_slam *s, int64_t now_ns, const char *reas
 	__atomic_store_n(&s->gate_frames_left, RESET_GATE_FRAMES, __ATOMIC_RELEASE);
 	t_slam_reset(s->xts);
 	xreal_air_slam_guard_restart(&s->guard);
+	planes_reset(s);
 	s->last_seen_ts = 0;
 	s->last_restart_ns = now_ns;
 	s->stats.restarts++;
@@ -745,6 +1001,8 @@ xreal_air_slam_create(enum u_logging_level log_level)
 	s->wear_debounce_ns = (int64_t)debug_get_num_option_xreal_air_slam_wear_debounce_ms() * U_TIME_1MS_IN_NS;
 	s->doff_lookback_ns = (int64_t)debug_get_num_option_xreal_air_slam_doff_lookback_ms() * U_TIME_1MS_IN_NS;
 	s->restart_min_ns = (int64_t)debug_get_num_option_xreal_air_slam_restart_min_ms() * U_TIME_1MS_IN_NS;
+	s->planes_requested = debug_get_bool_option_xreal_air_planes();
+	s->planes_world_seen = UINT32_MAX;
 
 	struct xreal_air_slam_guard_config cfg;
 	xreal_air_slam_guard_default_config(&cfg);
@@ -901,6 +1159,12 @@ xreal_air_slam_push_stereo(struct xreal_air_slam *s,
 	xrt_sink_push_frame(sinks->cams[0], left);
 	xrt_sink_push_frame(sinks->cams[1], right);
 
+	// The plane detector keeps a few of them (references, it never blocks).
+	struct t_plane_detector *planes = planes_get(s);
+	if (planes != NULL) {
+		t_plane_detector_push_stereo(planes, timestamp_ns, left, right);
+	}
+
 	if (__atomic_load_n(&s->gate_frames_left, __ATOMIC_ACQUIRE) > 0 &&
 	    __atomic_sub_fetch(&s->gate_frames_left, 1, __ATOMIC_ACQ_REL) == 0) {
 		__atomic_store_n(&s->gate_ts, timestamp_ns, __ATOMIC_RELEASE);
@@ -984,6 +1248,12 @@ get_slam_head_locked(struct xreal_air_slam *s, int64_t now, int64_t at_ns, struc
 		const enum xreal_air_slam_pose_verdict v = xreal_air_slam_guard_push(
 		    &s->guard, latest_ts, &latest.pose, have_vel ? &latest.linear_velocity : NULL, imu_still);
 		handle_verdict_locked(s, now, v, gap_ns);
+
+		// For the plane detection: data from before a new world started is the old world's.
+		if (s->guard.world_id != s->planes_world_seen) {
+			s->planes_world_seen = s->guard.world_id;
+			s->planes_world_start_ts = latest_ts;
+		}
 	}
 
 	if (!xreal_air_slam_guard_usable(&s->guard, now, latest_ts)) {
@@ -1154,6 +1424,21 @@ xreal_air_slam_destroy(struct xreal_air_slam **s_ptr)
 		clean = teardown_bounded(s, xfctx, &ms);
 		SLAM_INFO(s, "Tracker shut down in %.0f ms", ms);
 	}
+	// After the tracker: its pose queries feed the detector, the detector asks for its poses.
+	struct t_plane_detector *planes = planes_get(s);
+	__atomic_store_n(&s->planes, NULL, __ATOMIC_RELEASE);
+	if (planes != NULL) {
+		struct t_plane_detector_stats st;
+		t_plane_detector_get_stats(planes, &st);
+		SLAM_NOTE(s,
+		          "Plane detection: %" PRIu64 " stereo pairs (%.1f + %.1f + %.1f + %.1f ms), %" PRIu64
+		          " landmark batches, %" PRIu64 " resets, %u planes at the end",
+		          st.pairs_processed, st.prepare_ms, st.match_ms, st.points_ms, st.integrate_ms,
+		          st.sparse_batches, st.resets, st.planes);
+		t_plane_detector_destroy(&planes);
+	}
+	free(s->landmark_seen);
+
 	if (clean && s->vit_library != NULL) {
 		dlclose(s->vit_library); // A tracker left behind still runs its code, keep it loaded then.
 	}
@@ -1162,6 +1447,94 @@ xreal_air_slam_destroy(struct xreal_air_slam **s_ptr)
 	os_mutex_destroy(&s->lock);
 	free(s->imu_queue);
 	free(s);
+}
+
+bool
+xreal_air_slam_planes_enabled(struct xreal_air_slam *s)
+{
+	return s != NULL && s->planes_requested;
+}
+
+uint32_t
+xreal_air_slam_get_planes(struct xreal_air_slam *s, struct xreal_air_plane *out, uint32_t max)
+{
+	struct t_plane_detector *d = s != NULL ? planes_get(s) : NULL;
+	if (d == NULL || max == 0) {
+		return 0;
+	}
+
+	// The output frame is align * xr_world * SLAM world, for the world the output is anchored in.
+	os_mutex_lock(&s->lock);
+	const bool have_world = s->blend.have_world;
+	const uint32_t world_id = s->blend.world_id;
+	const struct xrt_pose align = s->blend.align_to;
+	const bool tracking = s->tracking;
+	os_mutex_unlock(&s->lock);
+	if (!have_world) {
+		return 0;
+	}
+
+	struct t_plane planes[PLANES_MAX];
+	uint32_t snap_world = 0;
+	uint64_t generation = 0;
+	const uint32_t n =
+	    t_plane_detector_get_planes(d, true, &snap_world, &generation, planes, MIN(max, (uint32_t)PLANES_MAX));
+	if (snap_world != world_id) {
+		return 0;
+	}
+
+	// Basalt's world is Z up, OpenXR's Y up: -90 degrees about x (see xreal_air_basalt_to_head).
+	static const struct xrt_pose xr_world = {{-0.70710678118654752f, 0, 0, 0.70710678118654752f}, {0, 0, 0}};
+	struct xrt_pose T_out_world;
+	math_pose_transform(&align, &xr_world, &T_out_world);
+
+	enum xrt_space_relation_flags flags = (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
+	                                                                      XRT_SPACE_RELATION_POSITION_VALID_BIT);
+	if (tracking) {
+		flags = (enum xrt_space_relation_flags)(flags | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
+		                                        XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+	}
+
+	for (uint32_t i = 0; i < n; i++) {
+		const struct t_plane *p = &planes[i];
+		struct xrt_pose T_world_plane = {
+		    .orientation = {0, 0, sinf(0.5f * p->yaw), cosf(0.5f * p->yaw)},
+		    .position = {p->center.x, p->center.y, p->height},
+		};
+		struct xreal_air_plane *o = &out[i];
+		memset(o, 0, sizeof(*o));
+		math_pose_transform(&T_out_world, &T_world_plane, &o->location.pose);
+		o->location.id = p->id;
+		o->location.relation_flags = flags;
+		o->location.extents = p->extents;
+		o->location.orientation = XRT_PLANE_DETECTOR_ORIENTATION_HORIZONTAL_UPWARD_EXT;
+		o->location.semantic_type = p->label;
+		o->location.vertex_count = p->vertex_count;
+		memcpy(o->vertices, p->vertices, sizeof(struct xrt_vec2) * p->vertex_count);
+		o->location.vertices = o->vertices;
+	}
+	return n;
+}
+
+uint32_t
+xreal_air_slam_get_planes_debug(struct xreal_air_slam *s,
+                                struct t_plane *out,
+                                uint32_t max,
+                                struct t_plane_detector_stats *out_stats)
+{
+	struct t_plane_detector *d = s != NULL ? planes_get(s) : NULL;
+	if (d == NULL) {
+		if (out_stats != NULL) {
+			memset(out_stats, 0, sizeof(*out_stats));
+		}
+		return 0;
+	}
+	if (out_stats != NULL) {
+		t_plane_detector_get_stats(d, out_stats);
+	}
+	uint32_t world = 0;
+	uint64_t generation = 0;
+	return t_plane_detector_get_planes(d, false, &world, &generation, out, max);
 }
 
 #endif // XRT_FEATURE_SLAM

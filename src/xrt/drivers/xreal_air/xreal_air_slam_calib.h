@@ -85,6 +85,15 @@ void
 xreal_air_kb4_project_angles(const struct xreal_air_kb4 *kb4, double theta, double phi, double out_uv[2]);
 
 /*!
+ * Unproject a pixel with a KB4 model (Newton on the radial polynomial) into a unit ray in the camera
+ * frame (x right, y down, z forward).
+ *
+ * @return false if the inversion did not converge or lands beyond ~108 degrees off axis.
+ */
+bool
+xreal_air_kb4_unproject(const struct xreal_air_kb4 *kb4, const double uv[2], double out_ray[3]);
+
+/*!
  * Fit a KB4 model to a factory fisheye624 camera over a grid of pixels covering the whole image
  * (step @p step_px, <= 0 for the default), by Levenberg-Marquardt on the pixel reprojection error.
  *

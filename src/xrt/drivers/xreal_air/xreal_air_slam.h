@@ -42,6 +42,24 @@
  *  - XREAL_AIR_SLAM_KB4_STEP_PX=8      Grid step of the fisheye624 -> KB4 fit.
  *  - SLAM_* (SLAM_PREDICTION_TYPE, SLAM_WRITE_CSVS, SLAM_CSV_PATH, SLAM_LOG, ...) as for t_slam.
  *
+ * Plane detection (XR_EXT_plane_detection, horizontal surfaces: tables, the floor), opt-in on top of
+ * the SLAM: a low priority worker (auxiliary/tracking/t_plane_detector.h) puts a half-resolution SGBM
+ * depth of the same stereo pairs (rectified through the factory fisheye624 model; optionally also
+ * Basalt's landmarks) into a gravity-aligned height map in the SLAM world, with the SLAM pose of each
+ * frame. Only
+ * data from while the output follows SLAM is used; a new SLAM world (fresh tracker, re-initialisation)
+ * drops the map. Planes are reported in the head pose's space (+Y up) once stable for a few seconds.
+ *  - XREAL_AIR_PLANES=1                Enable (needs XREAL_AIR_SLAM=1).
+ *  - XREAL_AIR_PLANES_HZ=4             Dense stereo pairs per second, 0 for landmarks only.
+ *  - XREAL_AIR_PLANES_LANDMARKS=0      Also use Basalt's landmarks (VIT pose features); measured to add
+ *                                      nothing over the dense stereo on the recordings, so off.
+ *  - XREAL_AIR_PLANES_STABLE_MS=5000   A plane is reported once it has held this long.
+ *  - XREAL_AIR_PLANES_MAX_SIGMA_CM=3   Points with a larger height uncertainty are not used.
+ *  - XREAL_AIR_PLANES_UPPER_MODE=0     Per column, prefer the highest height mode over a bigger one
+ *                                      below it (glossy tops mirror the room below the surface).
+ *  - XREAL_AIR_PLANES_NEAR_CM=60       Points nearer to the head than this are not used (hands).
+ *  - XREAL_AIR_PLANES_DUMP=/x/pts.bin  Debugging: dump the map's input points (monado-cli plane-map-replay).
+ *
  * @author Andrew Gaspar
  * @ingroup drv_xreal_air
  */
@@ -53,6 +71,9 @@
 #include "util/u_logging.h"
 
 #include "xreal_air_hmd.h"
+
+#include "tracking/t_plane_detections.h"
+#include "tracking/t_plane_map.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -128,6 +149,40 @@ xreal_air_slam_get_head_pose(struct xreal_air_slam *s,
  */
 void
 xreal_air_slam_get_status(struct xreal_air_slam *s, bool *out_ready, bool *out_tracking, bool *out_failed);
+
+//! A plane for the plane detection calls, in the head pose's space (Y up).
+struct xreal_air_plane
+{
+	struct t_plane_location location; //!< Its vertices point into @ref vertices.
+	struct xrt_vec2 vertices[T_PLANE_MAX_VERTICES];
+};
+
+//! XREAL_AIR_PLANES=1 was asked for and is available (the SLAM module exists).
+bool
+xreal_air_slam_planes_enabled(struct xreal_air_slam *s);
+
+/*!
+ * The detected planes in the head pose's space: empty until a plane has been stable for a while,
+ * and whenever the SLAM world they were found in is not the one the head pose currently follows.
+ *
+ * @return How many were written to @p out (at most @p max).
+ */
+uint32_t
+xreal_air_slam_get_planes(struct xreal_air_slam *s, struct xreal_air_plane *out, uint32_t max);
+
+struct t_plane_detector_stats;
+
+/*!
+ * For tools: the planes in the SLAM (Basalt, Z up) world, every tracked one (@p reportable flags
+ * the ones @ref xreal_air_slam_get_planes reports), and the detector's statistics.
+ *
+ * @return How many were written to @p out, 0 without plane detection.
+ */
+uint32_t
+xreal_air_slam_get_planes_debug(struct xreal_air_slam *s,
+                                struct t_plane *out,
+                                uint32_t max,
+                                struct t_plane_detector_stats *out_stats);
 
 /*!
  * Stop the tracker and free everything. Call after nothing pushes any more.

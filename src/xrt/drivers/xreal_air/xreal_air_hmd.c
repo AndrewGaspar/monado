@@ -32,6 +32,12 @@
 
 #include "xreal_air_capture.h"
 #include "xreal_air_slam.h"
+
+#include "tracking/t_plane_detections.h"
+#include "util/u_misc.h"
+
+//! Most planes reported to one detection.
+#define XREAL_AIR_MAX_PLANES 64
 #include "xreal_air_slam_guard.h"
 
 #include <errno.h>
@@ -157,6 +163,10 @@ struct xreal_air_hmd
 
 	//! Opt-in 6DoF tracking (XREAL_AIR_SLAM=1), fed by @ref capture, NULL otherwise.
 	struct xreal_air_slam *slam;
+
+	//! Plane detection requests (XR_EXT_plane_detection), all answered from the SLAM's one plane map.
+	struct os_mutex planes_mutex;
+	struct t_plane_requests plane_requests;
 
 	struct
 	{
@@ -1353,6 +1363,8 @@ teardown(struct xreal_air_hmd *hmd)
 	// After the capture, which feeds it.
 	xreal_air_slam_destroy(&hmd->slam);
 
+	os_mutex_destroy(&hmd->planes_mutex);
+
 	os_thread_helper_destroy(&hmd->oth);
 	os_mutex_destroy(&hmd->device_mutex);
 }
@@ -1494,6 +1506,88 @@ xreal_air_hmd_get_tracked_pose(struct xrt_device *xdev,
 	*out_relation = relation;
 
 	return XRT_SUCCESS;
+}
+
+/*
+ *
+ * Plane detection (XR_EXT_plane_detection), see xreal_air_slam.h.
+ *
+ */
+
+static xrt_result_t
+xreal_air_hmd_begin_plane_detection_ext(struct xrt_device *xdev,
+                                        const struct xrt_plane_detector_begin_info_ext *begin_info,
+                                        uint64_t plane_detection_id,
+                                        uint64_t *out_plane_detection_id)
+{
+	struct xreal_air_hmd *hmd = xreal_air_hmd(xdev);
+	(void)plane_detection_id; // The state tracker destroys the one it replaces itself.
+
+	os_mutex_lock(&hmd->planes_mutex);
+	const xrt_result_t xret = t_plane_requests_begin(&hmd->plane_requests, begin_info, out_plane_detection_id);
+	os_mutex_unlock(&hmd->planes_mutex);
+	return xret;
+}
+
+static xrt_result_t
+xreal_air_hmd_destroy_plane_detection_ext(struct xrt_device *xdev, uint64_t plane_detection_id)
+{
+	struct xreal_air_hmd *hmd = xreal_air_hmd(xdev);
+
+	os_mutex_lock(&hmd->planes_mutex);
+	t_plane_requests_destroy(&hmd->plane_requests, plane_detection_id);
+	os_mutex_unlock(&hmd->planes_mutex);
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+xreal_air_hmd_get_plane_detection_state_ext(struct xrt_device *xdev,
+                                            uint64_t plane_detection_id,
+                                            enum xrt_plane_detector_state_ext *out_state)
+{
+	struct xreal_air_hmd *hmd = xreal_air_hmd(xdev);
+	struct xrt_plane_detector_begin_info_ext query;
+
+	os_mutex_lock(&hmd->planes_mutex);
+	const bool known = t_plane_requests_get(&hmd->plane_requests, plane_detection_id, &query);
+	os_mutex_unlock(&hmd->planes_mutex);
+
+	// One shared map answers at once: a detection is done as soon as it is asked for.
+	*out_state = known ? XRT_PLANE_DETECTOR_STATE_DONE_EXT : XRT_PLANE_DETECTOR_STATE_NONE_EXT;
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+xreal_air_hmd_get_plane_detections_ext(struct xrt_device *xdev,
+                                       uint64_t plane_detection_id,
+                                       struct xrt_plane_detections_ext *out_detections)
+{
+	struct xreal_air_hmd *hmd = xreal_air_hmd(xdev);
+	struct xrt_plane_detector_begin_info_ext query;
+
+	os_mutex_lock(&hmd->planes_mutex);
+	const bool known = t_plane_requests_get(&hmd->plane_requests, plane_detection_id, &query);
+	os_mutex_unlock(&hmd->planes_mutex);
+	if (!known) {
+		out_detections->location_count = 0;
+		return XRT_ERROR_INVALID_ARGUMENT;
+	}
+
+	struct xreal_air_plane *planes = U_TYPED_ARRAY_CALLOC(struct xreal_air_plane, XREAL_AIR_MAX_PLANES);
+	struct t_plane_location *locations = U_TYPED_ARRAY_CALLOC(struct t_plane_location, XREAL_AIR_MAX_PLANES);
+	if (planes == NULL || locations == NULL) {
+		free(planes);
+		free(locations);
+		return XRT_ERROR_ALLOCATION;
+	}
+	const uint32_t n = xreal_air_slam_get_planes(hmd->slam, planes, XREAL_AIR_MAX_PLANES);
+	for (uint32_t i = 0; i < n; i++) {
+		locations[i] = planes[i].location;
+	}
+	const xrt_result_t xret = t_plane_detections_fill(&query, locations, n, out_detections);
+	free(planes);
+	free(locations);
+	return xret;
 }
 
 static xrt_result_t
@@ -1666,6 +1760,22 @@ xreal_air_hmd_create_device(struct os_hid_device *sensor_device,
 		xreal_air_slam_destroy(&hmd->slam);
 	}
 	hmd->base.supported.position_tracking = hmd->slam != NULL;
+
+	// Plane detection: one map in the SLAM module answers every request.
+	os_mutex_init(&hmd->planes_mutex);
+	t_plane_requests_init(&hmd->plane_requests);
+	if (xreal_air_slam_planes_enabled(hmd->slam)) {
+		hmd->base.supported.planes = true;
+		hmd->base.supported.plane_capability_flags = (enum xrt_plane_detection_capability_flags_ext)(
+		    XRT_PLANE_DETECTION_CAPABILITY_PLANE_DETECTION_BIT_EXT |
+		    XRT_PLANE_DETECTION_CAPABILITY_SEMANTIC_FLOOR_BIT_EXT |
+		    XRT_PLANE_DETECTION_CAPABILITY_SEMANTIC_PLATFORM_BIT_EXT |
+		    XRT_PLANE_DETECTION_CAPABILITY_ORIENTATION_BIT_EXT);
+		hmd->base.begin_plane_detection_ext = xreal_air_hmd_begin_plane_detection_ext;
+		hmd->base.destroy_plane_detection_ext = xreal_air_hmd_destroy_plane_detection_ext;
+		hmd->base.get_plane_detection_state_ext = xreal_air_hmd_get_plane_detection_state_ext;
+		hmd->base.get_plane_detections_ext = xreal_air_hmd_get_plane_detections_ext;
+	}
 
 	// The glasses only push display (wear) changes, so the state they start in is an assumption.
 	// Seeded before the read thread starts. Worn agrees with the SLAM's own "worn until told
