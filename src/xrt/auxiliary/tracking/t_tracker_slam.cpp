@@ -308,6 +308,10 @@ struct TrackerSlam
 	struct xrt_space_relation last_rel = XRT_SPACE_RELATION_ZERO; //!< Last reported/tracked pose
 	timepoint_ns last_ts;                                         //!< Last reported/tracked pose timestamp
 
+	//! Driver callback for the features of each pose (see @ref t_slam_set_features_callback).
+	t_slam_features_callback features_cb = nullptr;
+	void *features_cb_user = nullptr;
+
 	//! Filters are used to smooth out the resulting trajectory
 	struct
 	{
@@ -802,6 +806,19 @@ flush_poses(TrackerSlam &t)
 		if (t.features.enabled) {
 			vector feat_count = features_ui_push(t, pose, nts);
 			t.slam_features_writer->push({nts, feat_count});
+		}
+
+		if (t.features_cb != nullptr) {
+			for (uint32_t i = 0; i < t.cam_count; i++) {
+				vit_pose_features features = {};
+				if (t.vit.pose_get_features(pose, i, &features) != VIT_SUCCESS || features.count == 0) {
+					continue;
+				}
+				static_assert(sizeof(t_slam_feature) == sizeof(vit_pose_feature), "Same layout");
+				t.features_cb(t.features_cb_user, nts, i,
+				              reinterpret_cast<const t_slam_feature *>(features.features),
+				              features.count);
+			}
 		}
 
 		t.vit.pose_destroy(pose);
@@ -1426,6 +1443,33 @@ t_slam_get_latest_pose(struct xrt_tracked_slam *xts, timepoint_ns *out_ts, struc
 	}
 	*out_ts = ts;
 	return true;
+}
+
+extern "C" bool
+t_slam_get_slam_pose_at(struct xrt_tracked_slam *xts, timepoint_ns when_ns, struct xrt_space_relation *out_relation)
+{
+	auto &t = *container_of(xts, TrackerSlam, base);
+	const RelationHistory::Result r = t.slam_rels.get(when_ns, out_relation);
+	return r == M_RELATION_HISTORY_RESULT_EXACT || r == M_RELATION_HISTORY_RESULT_INTERPOLATED;
+}
+
+extern "C" int
+t_slam_set_features_callback(struct xrt_tracked_slam *xts, t_slam_features_callback cb, void *user)
+{
+	auto &t = *container_of(xts, TrackerSlam, base);
+	if (cb != nullptr && !t.exts.has_pose_features) {
+		SLAM_WARN("The VIT tracker cannot report pose features");
+		return -1;
+	}
+	vit_result_t vres =
+	    t.vit.tracker_enable_extension(t.tracker, VIT_TRACKER_EXTENSION_POSE_FEATURES, cb != nullptr);
+	if (vres != VIT_SUCCESS) {
+		SLAM_WARN("Failed to %s the VIT pose features extension", cb != nullptr ? "enable" : "disable");
+		return -1;
+	}
+	t.features_cb_user = user;
+	t.features_cb = cb;
+	return 0;
 }
 
 extern "C" int

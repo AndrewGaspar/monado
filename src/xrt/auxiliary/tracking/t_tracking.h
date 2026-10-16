@@ -714,6 +714,45 @@ bool
 t_slam_get_latest_pose(struct xrt_tracked_slam *xts, timepoint_ns *out_ts, struct xrt_space_relation *out_relation);
 
 /*!
+ * The pose the SLAM system itself produced at @p when_ns (interpolated between its poses, never
+ * predicted), for placing data stamped like the camera frames in its world. Thread safe.
+ *
+ * @return false if @p when_ns is not covered by the pose history (too new, too old, or empty).
+ * @public @memberof xrt_tracked_slam
+ */
+bool
+t_slam_get_slam_pose_at(struct xrt_tracked_slam *xts, timepoint_ns when_ns, struct xrt_space_relation *out_relation);
+
+/*!
+ * A feature (landmark observation) of a SLAM pose, the VIT pose features extension's layout: the
+ * landmark id, its projection into the camera (pixels, the camera model the tracker was given) and
+ * the inverse of its distance from the camera center (Basalt reports 1 / |p_cam|).
+ */
+struct t_slam_feature
+{
+	int64_t id;
+	float u, v;
+	float inv_depth;
+};
+
+/*!
+ * Called for each camera of each new SLAM pose that has features, from whichever thread makes
+ * t_slam dequeue poses (the pose queries). Keep it short.
+ */
+typedef void (*t_slam_features_callback)(
+    void *user, timepoint_ns timestamp_ns, uint32_t cam_index, const struct t_slam_feature *features, uint32_t count);
+
+/*!
+ * Enable (non-NULL @p cb) or disable the VIT pose features extension and report each pose's features
+ * to @p cb. Set it before poses are queried.
+ *
+ * @return 0 on success, -1 if the tracker does not support the extension.
+ * @public @memberof xrt_tracked_slam
+ */
+int
+t_slam_set_features_callback(struct xrt_tracked_slam *xts, t_slam_features_callback cb, void *user);
+
+/*!
  * Ask the SLAM system to reset its state (VIT tracker_reset): it forgets its map and starts a new
  * world with one of the next frames. Cheap, does not block.
  *
