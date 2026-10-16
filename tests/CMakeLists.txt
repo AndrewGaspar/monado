@@ -49,6 +49,7 @@ endif()
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	list(APPEND tests tests_levenbergmarquardt)
 endif()
+list(APPEND tests tests_t_plane)
 if(XRT_BUILD_DRIVER_XREAL_AIR)
 	list(APPEND tests tests_xreal_air_camera_decode tests_xreal_air_camera_pairing
 	     tests_xreal_air_gyro_bias_store tests_xreal_air_slam
@@ -162,3 +163,10 @@ if(XRT_BUILD_DRIVER_XREAL_AIR)
 	target_include_directories(tests_xreal_air_slam PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers)
 	target_link_libraries(tests_xreal_air_slam PRIVATE aux_math xrt-interfaces)
 endif()
+
+# The plane map and query answering are pure, build them straight in.
+target_sources(
+	tests_t_plane PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary/tracking/t_plane_map.cpp
+			      ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary/tracking/t_plane_detections.c
+	)
+target_link_libraries(tests_t_plane PRIVATE aux_math xrt-interfaces)
