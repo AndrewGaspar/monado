@@ -61,7 +61,7 @@ if(XRT_BUILD_DRIVER_SIMULATED)
 		drv_simulated STATIC simulated/simulated_controller.c simulated/simulated_hmd.c
 				     simulated/simulated_interface.h simulated/simulated_prober.c
 		)
-	target_link_libraries(drv_simulated PRIVATE xrt-interfaces aux_util)
+	target_link_libraries(drv_simulated PRIVATE xrt-interfaces aux_util aux_tracking)
 	list(APPEND ENABLED_HEADSET_DRIVERS simulated)
 endif()
 

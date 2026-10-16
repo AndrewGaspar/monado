@@ -23,9 +23,13 @@
 #include "util/u_time.h"
 #include "util/u_var.h"
 
+#include "os/os_threading.h"
+#include "tracking/t_plane_detections.h"
+
 #include "simulated_interface.h"
 
 #include <stdio.h>
+#include <string.h>
 
 
 /*
@@ -33,6 +37,9 @@
  * Structs and defines.
  *
  */
+
+//! Most static planes from SIMULATED_PLANES.
+#define SIMULATED_MAX_PLANES 8
 
 /*!
  * A example HMD device.
@@ -51,6 +58,13 @@ struct simulated_hmd
 
 	enum u_logging_level log_level;
 	enum simulated_movement movement;
+
+	//! Static planes from SIMULATED_PLANES, for testing plane detection consumers without hardware.
+	struct os_mutex planes_mutex;
+	struct t_plane_requests plane_requests;
+	uint32_t plane_count;
+	struct t_plane_location planes[SIMULATED_MAX_PLANES];
+	struct xrt_vec2 plane_vertices[SIMULATED_MAX_PLANES][4];
 };
 
 
@@ -68,6 +82,7 @@ simulated_hmd(struct xrt_device *xdev)
 
 DEBUG_GET_ONCE_LOG_OPTION(simulated_log, "SIMULATED_LOG", U_LOGGING_WARN)
 DEBUG_GET_ONCE_NUM_OPTION(view_count, "SIMULATED_VIEW_COUNT", 2)
+DEBUG_GET_ONCE_OPTION(simulated_planes, "SIMULATED_PLANES", NULL)
 
 #define HMD_TRACE(hmd, ...) U_LOG_XDEV_IFL_T(&hmd->base, hmd->log_level, __VA_ARGS__)
 #define HMD_DEBUG(hmd, ...) U_LOG_XDEV_IFL_D(&hmd->base, hmd->log_level, __VA_ARGS__)
@@ -82,6 +97,7 @@ simulated_hmd_destroy(struct xrt_device *xdev)
 	// Remove the variable tracking.
 	u_var_remove_root(dh);
 
+	os_mutex_destroy(&dh->planes_mutex);
 	u_device_free(&dh->base);
 }
 
@@ -176,6 +192,112 @@ simulated_ref_space_usage(struct xrt_device *xdev,
 
 /*
  *
+ * Static planes (SIMULATED_PLANES).
+ *
+ */
+
+static xrt_result_t
+simulated_hmd_begin_plane_detection_ext(struct xrt_device *xdev,
+                                        const struct xrt_plane_detector_begin_info_ext *begin_info,
+                                        uint64_t plane_detection_id,
+                                        uint64_t *out_plane_detection_id)
+{
+	struct simulated_hmd *hmd = simulated_hmd(xdev);
+	(void)plane_detection_id;
+	os_mutex_lock(&hmd->planes_mutex);
+	xrt_result_t xret = t_plane_requests_begin(&hmd->plane_requests, begin_info, out_plane_detection_id);
+	os_mutex_unlock(&hmd->planes_mutex);
+	return xret;
+}
+
+static xrt_result_t
+simulated_hmd_destroy_plane_detection_ext(struct xrt_device *xdev, uint64_t plane_detection_id)
+{
+	struct simulated_hmd *hmd = simulated_hmd(xdev);
+	os_mutex_lock(&hmd->planes_mutex);
+	t_plane_requests_destroy(&hmd->plane_requests, plane_detection_id);
+	os_mutex_unlock(&hmd->planes_mutex);
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+simulated_hmd_get_plane_detection_state_ext(struct xrt_device *xdev,
+                                            uint64_t plane_detection_id,
+                                            enum xrt_plane_detector_state_ext *out_state)
+{
+	struct simulated_hmd *hmd = simulated_hmd(xdev);
+	struct xrt_plane_detector_begin_info_ext query;
+	os_mutex_lock(&hmd->planes_mutex);
+	const bool known = t_plane_requests_get(&hmd->plane_requests, plane_detection_id, &query);
+	os_mutex_unlock(&hmd->planes_mutex);
+	*out_state = known ? XRT_PLANE_DETECTOR_STATE_DONE_EXT : XRT_PLANE_DETECTOR_STATE_NONE_EXT;
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+simulated_hmd_get_plane_detections_ext(struct xrt_device *xdev,
+                                       uint64_t plane_detection_id,
+                                       struct xrt_plane_detections_ext *out_detections)
+{
+	struct simulated_hmd *hmd = simulated_hmd(xdev);
+	struct xrt_plane_detector_begin_info_ext query;
+	os_mutex_lock(&hmd->planes_mutex);
+	const bool known = t_plane_requests_get(&hmd->plane_requests, plane_detection_id, &query);
+	os_mutex_unlock(&hmd->planes_mutex);
+	if (!known) {
+		out_detections->location_count = 0;
+		return XRT_ERROR_INVALID_ARGUMENT;
+	}
+	return t_plane_detections_fill(&query, hmd->planes, hmd->plane_count, out_detections);
+}
+
+/*!
+ * SIMULATED_PLANES="<label>:<x>,<y>,<z>,<width>,<depth>;..." horizontal planes facing up, centered at
+ * (x, y, z) in the tracking origin (Y up), width along X, depth along Z; label floor, table (PLATFORM)
+ * or anything else (undefined). E.g. "table:0,-0.55,-0.8,1.2,0.6;floor:0,-1.1,-1.5,3,3".
+ */
+static void
+simulated_hmd_parse_planes(struct simulated_hmd *hmd, const char *spec)
+{
+	char buf[1024];
+	snprintf(buf, sizeof(buf), "%s", spec);
+	char *save = NULL;
+	for (char *item = strtok_r(buf, ";", &save); item != NULL && hmd->plane_count < SIMULATED_MAX_PLANES;
+	     item = strtok_r(NULL, ";", &save)) {
+		char label[32] = "";
+		float x, y, z, w, d;
+		if (sscanf(item, " %31[^:]:%f,%f,%f,%f,%f", label, &x, &y, &z, &w, &d) != 6 || w <= 0 || d <= 0) {
+			HMD_ERROR(hmd, "SIMULATED_PLANES: could not parse '%s'", item);
+			continue;
+		}
+		const uint32_t i = hmd->plane_count++;
+		struct t_plane_location *l = &hmd->planes[i];
+		memset(l, 0, sizeof(*l));
+		l->id = i + 1;
+		// The plane's +Z (its normal) is up: -90 degrees about X; its +Y is then -Z (away).
+		l->pose.orientation = (struct xrt_quat){-0.70710678f, 0, 0, 0.70710678f};
+		l->pose.position = (struct xrt_vec3){x, y, z};
+		l->relation_flags = (enum xrt_space_relation_flags)(
+		    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
+		    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+		l->extents = (struct xrt_vec2){w, d};
+		l->orientation = XRT_PLANE_DETECTOR_ORIENTATION_HORIZONTAL_UPWARD_EXT;
+		l->semantic_type = strcmp(label, "floor") == 0   ? XRT_PLANE_DETECTOR_SEMANTIC_TYPE_FLOOR_EXT
+		                   : strcmp(label, "table") == 0 ? XRT_PLANE_DETECTOR_SEMANTIC_TYPE_PLATFORM_EXT
+		                                                 : XRT_PLANE_DETECTOR_SEMANTIC_TYPE_UNDEFINED_EXT;
+		hmd->plane_vertices[i][0] = (struct xrt_vec2){-w / 2, -d / 2};
+		hmd->plane_vertices[i][1] = (struct xrt_vec2){w / 2, -d / 2};
+		hmd->plane_vertices[i][2] = (struct xrt_vec2){w / 2, d / 2};
+		hmd->plane_vertices[i][3] = (struct xrt_vec2){-w / 2, d / 2};
+		l->vertex_count = 4;
+		l->vertices = hmd->plane_vertices[i];
+		HMD_INFO(hmd, "Static plane #%u '%s' at (%.2f, %.2f, %.2f), %.2f x %.2f m", l->id, label, x, y, z, w,
+		         d);
+	}
+}
+
+/*
+ *
  * 'Exported' functions.
  *
  */
@@ -209,6 +331,25 @@ simulated_hmd_create(enum simulated_movement movement, const struct xrt_pose *ce
 	hmd->movement = movement;
 
 	hmd->base.hmd->view_count = debug_get_num_option_view_count();
+
+	os_mutex_init(&hmd->planes_mutex);
+	t_plane_requests_init(&hmd->plane_requests);
+	const char *planes = debug_get_option_simulated_planes();
+	if (planes != NULL && planes[0] != '\0') {
+		simulated_hmd_parse_planes(hmd, planes);
+	}
+	if (hmd->plane_count > 0) {
+		hmd->base.supported.planes = true;
+		hmd->base.supported.plane_capability_flags = (enum xrt_plane_detection_capability_flags_ext)(
+		    XRT_PLANE_DETECTION_CAPABILITY_PLANE_DETECTION_BIT_EXT |
+		    XRT_PLANE_DETECTION_CAPABILITY_SEMANTIC_FLOOR_BIT_EXT |
+		    XRT_PLANE_DETECTION_CAPABILITY_SEMANTIC_PLATFORM_BIT_EXT |
+		    XRT_PLANE_DETECTION_CAPABILITY_ORIENTATION_BIT_EXT);
+		hmd->base.begin_plane_detection_ext = simulated_hmd_begin_plane_detection_ext;
+		hmd->base.destroy_plane_detection_ext = simulated_hmd_destroy_plane_detection_ext;
+		hmd->base.get_plane_detection_state_ext = simulated_hmd_get_plane_detection_state_ext;
+		hmd->base.get_plane_detections_ext = simulated_hmd_get_plane_detections_ext;
+	}
 	// Print name.
 	snprintf(hmd->base.str, XRT_DEVICE_NAME_LEN, "Simulated HMD");
 	snprintf(hmd->base.serial, XRT_DEVICE_NAME_LEN, "Simulated HMD");
