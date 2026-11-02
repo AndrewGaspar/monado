@@ -22,6 +22,11 @@
  *                             keep showing the last frame, like glasses lying on a desk.
  *  - XREAL_SLAM_REPLAY_DOFF   report the glasses taken off for the window (display off / on edges).
  *
+ * XREAL_SLAM_REPLAY_CAM_BUFFERS=<n> makes the frame push behave like the live camera thread's: a pair
+ * that arrives while @p n earlier ones are still waiting to be pushed (the push blocks while the
+ * tracker's queue is full) is lost, like the kernel drops frames when every V4L2 buffer is taken
+ * (the driver has 4 buffers of single frames, i.e. 2 pairs). 0 (default): every pair is pushed, late.
+ *
  * Writes <out_dir>/head_poses.csv (one line per pose query) and, through t_slam's CSV writers,
  * <out_dir>/tracking.csv (raw SLAM poses, Basalt frames, shifted clock).
  *
@@ -464,6 +469,15 @@ cli_cmd_xreal_slam_replay(int argc, const char **argv)
 		}
 	}
 
+	// Live-like camera buffers: arrival and push (dequeue) times of the pairs taken, newest last.
+	const char *cam_buffers_env = getenv("XREAL_SLAM_REPLAY_CAM_BUFFERS");
+	const int cam_buffers = cam_buffers_env != NULL ? atoi(cam_buffers_env) : 0;
+#define CAM_RING 16
+	int64_t taken_arrival[CAM_RING] = {0}, taken_dequeue[CAM_RING] = {0};
+	uint32_t taken_count = 0;
+	uint64_t cam_lost = 0;
+	double push_max_ms = 0;
+
 	size_t ii = 0, ci = 0;
 	int64_t next_query = first + offset;
 	uint64_t queries = 0, queries_tracking = 0;
@@ -526,6 +540,23 @@ cli_cmd_xreal_slam_replay(int argc, const char **argv)
 			if (!in_window(&still, rel_s)) {
 				snprintf(frozen_frame, sizeof(frozen_frame), "%s", r->name);
 			}
+			if (cam_buffers > 0) {
+				// Pairs taken before this one arrived and still not pushed when it did.
+				int waiting = 0;
+				for (uint32_t k = 0; k < taken_count && k < CAM_RING; k++) {
+					const uint32_t j = (taken_count - 1 - k) % CAM_RING;
+					if (taken_arrival[j] < t_cam && taken_dequeue[j] > t_cam) {
+						waiting++;
+					}
+				}
+				if (waiting >= cam_buffers) {
+					cam_lost++;
+					continue;
+				}
+				const uint32_t j = taken_count++ % CAM_RING;
+				taken_arrival[j] = t_cam;
+				taken_dequeue[j] = (int64_t)os_monotonic_get_ns();
+			}
 			const char *name = frozen_frame[0] != '\0' ? frozen_frame : r->name;
 			struct xrt_frame *l = load_frame(dir, 0, name);
 			struct xrt_frame *rt = load_frame(dir, 1, name);
@@ -534,7 +565,10 @@ cli_cmd_xreal_slam_replay(int argc, const char **argv)
 				memset(rt->data, 0, rt->size);
 			}
 			if (l != NULL && rt != NULL) {
+				const int64_t p0 = (int64_t)os_monotonic_get_ns();
 				xreal_air_slam_push_stereo(s, r->ts + offset, r->exposure, l, rt);
+				const double ms = (double)((int64_t)os_monotonic_get_ns() - p0) / 1e6;
+				push_max_ms = ms > push_max_ms ? ms : push_max_ms;
 			}
 			xrt_frame_reference(&l, NULL);
 			xrt_frame_reference(&rt, NULL);
@@ -570,6 +604,8 @@ cli_cmd_xreal_slam_replay(int argc, const char **argv)
 	P("%" PRIu64 " pose queries, %" PRIu64 " (%.1f%%) on SLAM\n", queries, queries_tracking,
 	  queries > 0 ? 100.0 * (double)queries_tracking / (double)queries : 0.0);
 	P("Shifted clock: dataset time = shifted time - %" PRId64 "\n", offset);
+	P("Longest stereo push %.1f ms, %" PRIu64 " pairs lost to full camera buffers (XREAL_SLAM_REPLAY_CAM_BUFFERS=%d)\n",
+	  push_max_ms, cam_lost, cam_buffers);
 	snprintf(path, sizeof(path), "%s/offset_ns.txt", out_dir);
 	FILE *of = fopen(path, "w");
 	if (of != NULL) {
