@@ -913,6 +913,14 @@ apply_cpu_affinity(struct xreal_air_slam *s)
 	SLAM_NOTE(s, "Tracker threads pinned to CPUs %s (XREAL_AIR_SLAM_CPUS)", list);
 }
 
+/*!
+ * The tracker thread. Deliberately left at the normal policy (SCHED_OTHER): do
+ * not make it real-time like the compositor thread (XRT_COMPOSITOR_THREAD_REALTIME).
+ * SLAM is CPU-bound: on a Lunar Lake laptop with 6DoF on, the busiest SLAM thread
+ * uses about 76% of a core and a second one about 25%. Threads the tracker starts
+ * from here inherit this thread's policy, so a real-time tracker would starve the
+ * desktop (and, at an equal or higher priority, the compositor thread itself).
+ */
 static void *
 tracker_thread(void *ptr)
 {
