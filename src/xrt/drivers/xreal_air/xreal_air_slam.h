@@ -40,6 +40,10 @@
  *                                      IMU has seen the head move.
  *  - XREAL_AIR_SLAM_RESTART_MIN_MS=3000  At most one divergence restart this often.
  *  - XREAL_AIR_SLAM_KB4_STEP_PX=8      Grid step of the fisheye624 -> KB4 fit.
+ *  - XREAL_AIR_SLAM_CPUS=4-7           Pin the tracker to these CPUs (a cpulist, as for taskset -c):
+ *                                      this module's thread and every thread it starts, that is all of
+ *                                      Basalt's and the plane detector. For core-placement experiments
+ *                                      on hybrid CPUs. Unset (default): no affinity.
  *  - SLAM_* (SLAM_PREDICTION_TYPE, SLAM_WRITE_CSVS, SLAM_CSV_PATH, SLAM_LOG, ...) as for t_slam.
  *
  * Plane detection (XR_EXT_plane_detection, horizontal surfaces: tables, the floor), opt-in on top of

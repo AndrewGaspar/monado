@@ -1,5 +1,8 @@
 // Copyright 2026, Andrew Gaspar
 // SPDX-License-Identifier: BSL-1.0
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE // cpu_set_t, pthread_setaffinity_np (XREAL_AIR_SLAM_CPUS)
+#endif
 /*!
  * @file
  * @brief  Xreal Air 2 Ultra 6DoF: visual-inertial SLAM through Monado's t_slam / VIT (Basalt).
@@ -150,11 +153,14 @@ xreal_air_slam_get_planes_debug(struct xreal_air_slam *s,
 #include <limits.h>
 #include <math.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 DEBUG_GET_ONCE_OPTION(xreal_air_slam_config, "XREAL_AIR_SLAM_CONFIG", NULL)
+DEBUG_GET_ONCE_OPTION(xreal_air_slam_cpus, "XREAL_AIR_SLAM_CPUS", NULL)
 DEBUG_GET_ONCE_NUM_OPTION(xreal_air_slam_cam_offset_us, "XREAL_AIR_SLAM_CAM_OFFSET_US", 0)
 DEBUG_GET_ONCE_NUM_OPTION(xreal_air_slam_stale_ms, "XREAL_AIR_SLAM_STALE_MS", 300)
 DEBUG_GET_ONCE_NUM_OPTION(xreal_air_slam_fresh_ms, "XREAL_AIR_SLAM_FRESH_MS", 250)
@@ -849,11 +855,70 @@ restart_tracker(struct xreal_air_slam *s, bool want, const char *reason, struct 
 	}
 }
 
+//! A cpulist ("4-7", "0,2,8-11") into @p set; false if malformed or empty.
+static bool
+parse_cpu_list(const char *str, cpu_set_t *set)
+{
+	CPU_ZERO(set);
+	const char *p = str;
+	while (*p != '\0') {
+		char *end = NULL;
+		const long first = strtol(p, &end, 10);
+		if (end == p || first < 0 || first >= CPU_SETSIZE) {
+			return false;
+		}
+		long last = first;
+		p = end;
+		if (*p == '-') {
+			last = strtol(p + 1, &end, 10);
+			if (end == p + 1 || last < first || last >= CPU_SETSIZE) {
+				return false;
+			}
+			p = end;
+		}
+		for (long c = first; c <= last; c++) {
+			CPU_SET((int)c, set);
+		}
+		if (*p == ',') {
+			p++;
+		} else if (*p != '\0') {
+			return false;
+		}
+	}
+	return CPU_COUNT(set) > 0;
+}
+
+/*!
+ * XREAL_AIR_SLAM_CPUS: pin the calling (tracker) thread. Threads inherit their creator's affinity, and
+ * Basalt's threads (the VIT tracker, its frontend / backend / consumer) and the plane detector are all
+ * started from this thread, so they are covered too. Basalt runs with num-threads=1 (no TBB workers).
+ */
+static void
+apply_cpu_affinity(struct xreal_air_slam *s)
+{
+	const char *list = debug_get_option_xreal_air_slam_cpus();
+	if (list == NULL || list[0] == '\0') {
+		return;
+	}
+	cpu_set_t set;
+	if (!parse_cpu_list(list, &set)) {
+		SLAM_ERROR(s, "XREAL_AIR_SLAM_CPUS='%s' is not a cpulist (like 4-7 or 0,2,8-11), not pinning", list);
+		return;
+	}
+	const int ret = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+	if (ret != 0) {
+		SLAM_ERROR(s, "Could not pin the tracker to CPUs %s (%s)", list, strerror(ret));
+		return;
+	}
+	SLAM_NOTE(s, "Tracker threads pinned to CPUs %s (XREAL_AIR_SLAM_CPUS)", list);
+}
+
 static void *
 tracker_thread(void *ptr)
 {
 	struct xreal_air_slam *s = (struct xreal_air_slam *)ptr;
 	os_thread_helper_name(&s->oth, "XREAL Air SLAM");
+	apply_cpu_affinity(s);
 
 	struct xrt_imu_sample batch[IMU_BATCH];
 	struct xrt_slam_sinks *sinks = NULL; // This thread's view of the current tracker.
