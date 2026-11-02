@@ -532,6 +532,18 @@ TEST_CASE("flight_capture_refusals_and_limits")
 		CHECK(stat((out + "/xreal/frames.bin").c_str(), &sb) != 0);
 	}
 
+	SECTION("one recorder per control directory")
+	{
+		Recorder rec;
+		xreal_air_flight_config cfg{};
+		cfg.log_level = U_LOGGING_WARN;
+		snprintf(cfg.ctl_dir, sizeof(cfg.ctl_dir), "%s", rec.ctl.c_str());
+		cfg.lookback_s = 1;
+		CHECK(xreal_air_flight_create(&cfg) == nullptr);
+		auto st = rec.command("mark", "label=still answered by the first");
+		CHECK(st["cmd_result"] == "ok");
+	}
+
 	SECTION("a mark while idle stays in the event ring")
 	{
 		Recorder rec;

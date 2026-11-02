@@ -43,6 +43,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/inotify.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -217,6 +218,7 @@ struct xreal_air_flight
 
 	struct os_thread_helper oth;
 	int inotify_fd;
+	int owner_fd; //!< flock()ed control directory: one runtime answers there.
 
 	// Writer thread only.
 	struct capture cap;
@@ -1320,6 +1322,7 @@ xreal_air_flight_create(const struct xreal_air_flight_config *config)
 	}
 	f->cfg = *config;
 	f->inotify_fd = -1;
+	f->owner_fd = -1;
 	if (os_mutex_init(&f->frames.lock) != 0 || os_mutex_init(&f->meta_lock) != 0 ||
 	    os_thread_helper_init(&f->oth) != 0) {
 		free(f);
@@ -1354,6 +1357,17 @@ xreal_air_flight_create(const struct xreal_air_flight_config *config)
 		FL_ERROR(f, "Could not create the control directory '%s': %s", f->cfg.ctl_dir, strerror(errno));
 	} else {
 		(void)chmod(f->cfg.ctl_dir, 0700);
+
+		// Another runtime (or a monado-cli opening the glasses meanwhile) owns it: stay out.
+		char owner[PATH_MAX + 16];
+		(void)snprintf(owner, sizeof(owner), "%s/.owner", f->cfg.ctl_dir);
+		f->owner_fd = open(owner, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+		if (f->owner_fd < 0 || flock(f->owner_fd, LOCK_EX | LOCK_NB) != 0) {
+			FL_NOTE(f, "Off: another process owns the control directory '%s'", f->cfg.ctl_dir);
+			xreal_air_flight_destroy(&f);
+			return NULL;
+		}
+
 		f->inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
 		if (f->inotify_fd >= 0 &&
 		    inotify_add_watch(f->inotify_fd, f->cfg.ctl_dir, IN_CLOSE_WRITE | IN_MOVED_TO) < 0) {
@@ -1502,6 +1516,9 @@ xreal_air_flight_destroy(struct xreal_air_flight **f_ptr)
 	os_thread_helper_destroy(&f->oth);
 	if (f->inotify_fd >= 0) {
 		(void)close(f->inotify_fd);
+	}
+	if (f->owner_fd >= 0) {
+		(void)close(f->owner_fd);
 	}
 
 	f->armed_frames_s = 0;
