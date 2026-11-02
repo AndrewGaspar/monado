@@ -753,6 +753,34 @@ int
 t_slam_set_features_callback(struct xrt_tracked_slam *xts, t_slam_features_callback cb, void *user);
 
 /*!
+ * Called for each new SLAM pose with its pipeline timestamps (CLOCK_MONOTONIC ns), in the order of
+ * @ref t_slam_get_timing_columns: the pose (frame) timestamp first, then the VIT pose timing
+ * extension's stages, last when t_slam dequeued the pose. Poses the tracker produced before the
+ * timing extension was on only carry the first and last. From whichever thread makes t_slam dequeue
+ * poses (the pose queries). Keep it short.
+ */
+typedef void (*t_slam_timing_callback)(void *user, const int64_t *timestamps, uint32_t count);
+
+/*!
+ * Report each pose's pipeline timestamps to @p cb (NULL to stop), turning the VIT pose timing
+ * extension on if the tracker has it (it stays on). The same data as SLAM_WRITE_CSVS's timing.csv,
+ * without the file. Set it before poses are queried.
+ *
+ * @return 0.
+ * @public @memberof xrt_tracked_slam
+ */
+int
+t_slam_set_timing_callback(struct xrt_tracked_slam *xts, t_slam_timing_callback cb, void *user);
+
+/*!
+ * The names of the timing columns (comma separated, as timing.csv's header), valid as long as the
+ * tracker.
+ * @public @memberof xrt_tracked_slam
+ */
+const char *
+t_slam_get_timing_columns(struct xrt_tracked_slam *xts);
+
+/*!
  * Ask the SLAM system to reset its state (VIT tracker_reset): it forgets its map and starts a new
  * world with one of the next frames. Cheap, does not block.
  *

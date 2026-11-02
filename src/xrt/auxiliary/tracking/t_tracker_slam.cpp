@@ -317,6 +317,10 @@ struct TrackerSlam
 
 	//! Driver callback for the features of each pose (see @ref t_slam_set_features_callback).
 	t_slam_features_callback features_cb = nullptr;
+	//! Driver callback for the pipeline timestamps of each pose (see @ref t_slam_set_timing_callback).
+	t_slam_timing_callback timing_cb = nullptr;
+	void *timing_cb_user = nullptr;
+	string timing_columns_csv; //!< t_slam_get_timing_columns
 	void *features_cb_user = nullptr;
 
 	//! Filters are used to smooth out the resulting trajectory
@@ -809,6 +813,9 @@ flush_poses(TrackerSlam &t)
 
 		auto tss = timing_ui_push(t, pose, nts);
 		t.slam_times_writer->push(tss);
+		if (t.timing_cb != nullptr && !tss.empty()) {
+			t.timing_cb(t.timing_cb_user, tss.data(), (uint32_t)tss.size());
+		}
 
 		if (t.features.enabled) {
 			vector feat_count = features_ui_push(t, pose, nts);
@@ -1477,6 +1484,31 @@ t_slam_set_features_callback(struct xrt_tracked_slam *xts, t_slam_features_callb
 	t.features_cb_user = user;
 	t.features_cb = cb;
 	return 0;
+}
+
+extern "C" int
+t_slam_set_timing_callback(struct xrt_tracked_slam *xts, t_slam_timing_callback cb, void *user)
+{
+	auto &t = *container_of(xts, TrackerSlam, base);
+	// The per-stage timestamps come from the VIT pose timing extension, the same switch as the UI's.
+	if (cb != nullptr && t.exts.has_pose_timing && !t.timing.enabled) {
+		t.timing.enable_btn.cb(&t);
+	}
+	t.timing_cb_user = user;
+	t.timing_cb = cb;
+	return 0;
+}
+
+extern "C" const char *
+t_slam_get_timing_columns(struct xrt_tracked_slam *xts)
+{
+	auto &t = *container_of(xts, TrackerSlam, base);
+	if (t.timing_columns_csv.empty()) {
+		for (const string &name : t.timing.columns) {
+			t.timing_columns_csv += (t.timing_columns_csv.empty() ? "" : ",") + name;
+		}
+	}
+	return t.timing_columns_csv.c_str();
 }
 
 extern "C" int
