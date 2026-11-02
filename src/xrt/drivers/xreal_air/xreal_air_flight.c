@@ -379,7 +379,7 @@ verdict_name(int32_t v)
 	}
 }
 
-//! The time a record is "from", for the look-back cut-off; INT64_MAX = always included.
+//! The time a record is "from", for the look-back cut-off.
 static int64_t
 record_time(enum stream s, const union any_record *r)
 {
@@ -389,7 +389,7 @@ record_time(enum stream s, const union any_record *r)
 	case S_POSE: return r->pose.seen_ns;
 	case S_TIMING: return r->timing.count > 0 ? r->timing.ts[r->timing.count - 1] : 0;
 	case S_HEAD: return r->head.query_ns;
-	case S_EVENT: return INT64_MAX;
+	case S_EVENT: return r->event.ts_ns;
 	default: return 0;
 	}
 }
@@ -689,14 +689,31 @@ drain_frames(struct xreal_air_flight *f)
 		os_mutex_unlock(&f->frames.lock);
 
 		c->frame_cursor++;
-		if (write_pair(f, &slot)) {
+		const bool written = write_pair(f, &slot);
+		release_slot(&slot);
+
+		// Without a frame look-back nothing needs a written pair again: give its memory back now
+		// rather than when the slot is reused.
+		if (f->armed_frames_s == 0) {
+			struct frame_slot done = {0};
+			os_mutex_lock(&f->frames.lock);
+			const uint64_t index = c->frame_cursor - 1;
+			if (f->frames.capacity > 0 && f->frames.head - index <= f->frames.capacity) {
+				struct frame_slot *held = &f->frames.slots[index % f->frames.capacity];
+				done = *held;
+				U_ZERO(held);
+			}
+			os_mutex_unlock(&f->frames.lock);
+			release_slot(&done);
+		}
+
+		if (written) {
 			if (c->pairs_written++ == 0) {
 				c->first_pair_ns = slot.euroc_ns;
 			}
 		} else {
 			c->pairs_lost++;
 		}
-		release_slot(&slot);
 	}
 	return true;
 }
@@ -835,6 +852,10 @@ lookback_cursor(struct xreal_air_flight *f, enum stream s, int64_t cutoff_ns)
 	uint64_t i = xreal_air_flight_ring_oldest(ring, xreal_air_flight_ring_capacity(ring) / SLACK_DIV);
 	const uint64_t head = xreal_air_flight_ring_head(ring);
 	union any_record r;
+	// The whole event ring: the state changes before the window explain what happens in it.
+	if (s == S_EVENT) {
+		return i;
+	}
 	for (; i < head; i++) {
 		if (xreal_air_flight_ring_read(ring, i, &r) == XREAL_AIR_FLIGHT_RING_OK &&
 		    record_time(s, &r) >= cutoff_ns) {
@@ -1096,6 +1117,23 @@ write_status(struct xreal_air_flight *f)
 	              c->active ? c->dir : "", c->active ? (double)(now_ns() - c->start_ns) / U_TIME_1S_IN_NS : 0.0,
 	              (double)c->max_ns / U_TIME_1S_IN_NS, c->with_frames ? 1 : 0, c->pairs_written, c->pairs_lost,
 	              lost, c->mb, f->cmd_name, f->cmd_id, f->cmd_result, f->last_out, f->last_stop_reason);
+
+	// What the head pose does right now, from the newest records.
+	union any_record r;
+	const int64_t now = now_ns();
+	const uint64_t heads = xreal_air_flight_ring_head(f->rings[S_HEAD]);
+	if (heads > 0 && xreal_air_flight_ring_read(f->rings[S_HEAD], heads - 1, &r) == XREAL_AIR_FLIGHT_RING_OK) {
+		(void)fprintf(file, "head_age_ms=%.0f\nslam_tracking=%d\nslam_world=%u\n",
+		              (double)(now - r.head.query_ns) / U_TIME_1MS_IN_NS, r.head.slam ? 1 : 0, r.head.world_id);
+	}
+	const uint64_t poses = xreal_air_flight_ring_head(f->rings[S_POSE]);
+	if (poses > 0 && xreal_air_flight_ring_read(f->rings[S_POSE], poses - 1, &r) == XREAL_AIR_FLIGHT_RING_OK) {
+		(void)fprintf(file, "slam_pose_age_ms=%.0f\nslam_pose_latency_ms=%.1f\n",
+		              (double)(now - r.pose.ts_ns) / U_TIME_1MS_IN_NS,
+		              (double)(r.pose.seen_ns - r.pose.ts_ns) / U_TIME_1MS_IN_NS);
+	}
+	(void)fprintf(file, "status_mono_ns=%" PRId64 "\n", now);
+
 	(void)fclose(file);
 	(void)rename(tmp, path);
 }
@@ -1226,7 +1264,7 @@ writer_thread(void *ptr)
 		const int64_t now = now_ns();
 		check_limits(f, now);
 		if (now >= f->next_status_ns) {
-			f->next_status_ns = now + (c->active ? STATUS_INTERVAL_NS : 10 * STATUS_INTERVAL_NS);
+			f->next_status_ns = now + STATUS_INTERVAL_NS;
 			write_status(f);
 		}
 	}
