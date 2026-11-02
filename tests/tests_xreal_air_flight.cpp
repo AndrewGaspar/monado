@@ -572,7 +572,8 @@ TEST_CASE("flight_capture_refusals_and_limits")
  *   XREAL_FLIGHT_BENCH_FRAMES=frames.raw  (N x 2 x 480x640 L8, left then right)
  *   XREAL_FLIGHT_BENCH_TS=frames.ts       (N EuRoC timestamps, one per line)
  *   XREAL_FLIGHT_BENCH_EUROC=<dataset>    (mav0/imu0/data.csv, xreal/factory_calibration.json)
- *   XREAL_FLIGHT_BENCH_MODE=idle|zstd|raw|png|noflight   XREAL_FLIGHT_BENCH_OUT=<empty dir>
+ *   XREAL_FLIGHT_BENCH_MODE=idle|zstd|raw|csv|png|noflight   XREAL_FLIGHT_BENCH_OUT=<empty dir>
+ *   XREAL_FLIGHT_BENCH_START=0.5          when the capture starts (fraction of the slice)
  *   XREAL_FLIGHT_BENCH_ARM_S=0            frame look-back armed before the capture starts
  *   tests_xreal_air_flight "[.bench]"
  * Feeds the pairs and the IMU between them at their recorded rate (1x), as the driver would. In the
@@ -665,7 +666,7 @@ TEST_CASE("flight_bench", "[.bench]")
 	xreal_air_flight *f = nullptr;
 	xreal_air_record *record = nullptr;
 	std::string ctl = out_root + "/ctl";
-	const bool flight = mode == "idle" || mode == "zstd" || mode == "raw";
+	const bool flight = mode == "idle" || mode == "zstd" || mode == "raw" || mode == "csv";
 	if (flight) {
 		xreal_air_flight_config cfg{};
 		cfg.log_level = U_LOGGING_WARN;
@@ -757,7 +758,8 @@ TEST_CASE("flight_bench", "[.bench]")
 		xrt_frame_reference(&frames[1], nullptr);
 
 		if (p == start_at && f != nullptr && mode != "idle") {
-			drop("start", "out=" + out_root + "/cap\ncodec=" + mode + "\nlookback_s=60");
+			drop("start", "out=" + out_root + "/cap\nlookback_s=60\n" +
+			                  (mode == "csv" ? std::string("frames=0") : "codec=" + mode));
 		}
 		rss_peak = std::max(rss_peak, rss_kb());
 	}
@@ -783,4 +785,100 @@ TEST_CASE("flight_bench", "[.bench]")
 	    "peak\n",
 	    mode.c_str(), arm_s, pair_ts.size(), imu.size(), data_s, cpu, cpu / data_s * 1e3,
 	    (double)(rss_peak - rss0) / 1024.0);
+}
+
+/*!
+ * A stand-in runtime for testing the control tools (HypXRland's scripts/xreal-capture) without the
+ * glasses, hidden: XREAL_FLIGHT_BENCH_FRAMES / _TS as above, XREAL_FLIGHT_SERVE_CTL=<control dir>,
+ * XREAL_FLIGHT_SERVE_S=<seconds>. Loops the frames at 1x with a synthetic IMU, SLAM poses (latency
+ * rising to 400 ms for a second every 20 s), a tracking loss and a camera gap every 20 s.
+ */
+TEST_CASE("flight_serve", "[.serve]")
+{
+	const std::string pixels = slurp(env_or("XREAL_FLIGHT_BENCH_FRAMES", ""));
+	const size_t image = 480 * 640;
+	const size_t pairs = pixels.size() / (2 * image);
+	REQUIRE(pairs > 0);
+	const double serve_s = std::atof(env_or("XREAL_FLIGHT_SERVE_S", "60").c_str());
+
+	xreal_air_flight_config cfg{};
+	REQUIRE(xreal_air_flight_default_config(U_LOGGING_WARN, &cfg));
+	snprintf(cfg.ctl_dir, sizeof(cfg.ctl_dir), "%s", env_or("XREAL_FLIGHT_SERVE_CTL", "").c_str());
+	cfg.min_free_mb = 0;
+	xreal_air_flight *f = xreal_air_flight_create(&cfg);
+	REQUIRE(f != nullptr);
+	xreal_air_parsed_calibration calib{};
+	const char doc[] = "{\"synthetic\": true}";
+	xreal_air_flight_set_calibration(f, doc, sizeof(doc) - 1, &calib);
+	xreal_air_flight_set_timing_columns(f, "sampled,frontend_start,received_by_monado");
+
+	const int64_t t0 = (int64_t)os_monotonic_get_ns();
+	const int64_t pair_ns = 35460992; // 28.2 Hz
+	int64_t next_pair = t0;
+	bool lost = false;
+	uint64_t p = 0;
+	for (int64_t now = t0; now - t0 < (int64_t)(serve_s * 1e9); now = (int64_t)os_monotonic_get_ns()) {
+		const double t = (double)(now - t0) * 1e-9;
+		const double phase = std::fmod(t, 20.0);
+
+		xreal_air_record_imu s{};
+		s.host_ns = now;
+		s.euroc_ns = now;
+		s.device_ts = (uint64_t)now;
+		s.gyro = {0.01f, 0.0f, 0.0f};
+		s.accel = {0.0f, -9.81f, 0.0f};
+		xreal_air_flight_push_imu(f, &s);
+
+		const bool tracking = !(phase > 10.0 && phase < 13.0);
+		xreal_air_flight_head head{};
+		head.query_ns = now;
+		head.at_ns = now + 20000000;
+		head.pose.orientation.w = 1;
+		head.fusion.w = 1;
+		head.slam = tracking;
+		xreal_air_flight_push_head(f, &head);
+		if (tracking == lost) {
+			lost = !tracking;
+			xreal_air_flight_event(f, "tracking",
+			                       lost ? "lost #%u, newest pose 320 ms old" : "acquired #%u",
+			                       (unsigned)(t / 20) + 1);
+		}
+
+		if (now >= next_pair) {
+			next_pair += pair_ns;
+			const bool gap = phase > 9.0 && phase < 9.2; // No frames: a 200 ms camera gap.
+			if (!gap) {
+				xrt_frame *frames[2] = {nullptr, nullptr};
+				for (int c = 0; c < 2; c++) {
+					u_frame_create_one_off(XRT_FORMAT_L8, 480, 640, &frames[c]);
+					memcpy(frames[c]->data, pixels.data() + ((p % pairs) * 2 + c) * image, image);
+					xreal_air_record_cam_frame row{};
+					row.cam = (xreal_air_cam_id)c;
+					row.v4l2_sequence = (uint32_t)p;
+					row.kernel_ns = now - 9000000;
+					row.dequeue_ns = now;
+					row.euroc_ns = now - 30000000;
+					row.telemetry.exposure = 8000000;
+					xreal_air_flight_push_cam_frame(f, &row);
+				}
+				xreal_air_flight_push_stereo(f, now - 30000000, frames[0], frames[1]);
+				xrt_frame_reference(&frames[0], nullptr);
+				xrt_frame_reference(&frames[1], nullptr);
+
+				const int64_t latency = (phase > 9.0 && phase < 10.0) ? 400000000 : 60000000;
+				xreal_air_flight_slam_pose pose{};
+				pose.ts_ns = now - latency;
+				pose.seen_ns = now;
+				pose.pose.orientation.w = 1;
+				pose.world_id = 1;
+				pose.verdict = p == 0 ? 1 : 2;
+				xreal_air_flight_push_slam_pose(f, &pose);
+				const int64_t ts[3] = {pose.ts_ns, pose.ts_ns + 5000000, now};
+				xreal_air_flight_push_slam_timing(f, ts, 3);
+			}
+			p++;
+		}
+		std::this_thread::sleep_for(std::chrono::microseconds(1000));
+	}
+	xreal_air_flight_destroy(&f);
 }
