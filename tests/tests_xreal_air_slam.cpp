@@ -860,6 +860,83 @@ TEST_CASE("xreal_air_pos_history")
 	CHECK(p.x < 80.0f);
 }
 
+TEST_CASE("xreal_air_behind")
+{
+	const int64_t frame = 33333333;
+	xreal_air_behind b;
+
+	SECTION("off")
+	{
+		xreal_air_behind_init(&b, 0, 1000 * MS, 2);
+		for (int i = 0; i < 10; i++) {
+			xreal_air_behind_pushed(&b, i * frame);
+		}
+		CHECK_FALSE(xreal_air_behind_skip(&b, true, 0));
+		CHECK(b.skipped == 0);
+	}
+
+	SECTION("keeping up: never skipped")
+	{
+		xreal_air_behind_init(&b, 3, 1000 * MS, 2);
+		for (int i = 0; i < 100; i++) {
+			// The newest pose is two pairs back (one being processed, one not collected yet).
+			CHECK_FALSE(xreal_air_behind_skip(&b, i >= 2, (i - 2) * frame));
+			xreal_air_behind_pushed(&b, i * frame);
+		}
+		CHECK(b.skipped == 0);
+	}
+
+	SECTION("a gap in the camera stream is not the tracker being behind")
+	{
+		xreal_air_behind_init(&b, 3, 1000 * MS, 2);
+		for (int i = 0; i <= 10; i++) {
+			xreal_air_behind_pushed(&b, i * frame);
+		}
+		// Every pushed pair has its pose, then nothing arrives for 400 ms: push the next one.
+		CHECK_FALSE(xreal_air_behind_skip(&b, true, 10 * frame));
+		CHECK(b.last_pending == 0);
+	}
+
+	SECTION("no pose yet, or starting over: never skipped")
+	{
+		xreal_air_behind_init(&b, 3, 1000 * MS, 2);
+		for (int i = 0; i < 10; i++) {
+			xreal_air_behind_pushed(&b, i * frame);
+		}
+		CHECK_FALSE(xreal_air_behind_skip(&b, false, 0));
+		// The newest pose is from before a re-initialisation, over a second older than the pairs.
+		for (int i = 50; i < 60; i++) {
+			xreal_air_behind_pushed(&b, i * frame);
+		}
+		CHECK_FALSE(xreal_air_behind_skip(&b, true, 20 * frame));
+		CHECK(b.skipped == 0);
+	}
+
+	SECTION("behind: skipped, but never more than 2 in a row")
+	{
+		xreal_air_behind_init(&b, 3, 1000 * MS, 2);
+		for (int i = 0; i <= 13; i++) {
+			xreal_air_behind_pushed(&b, i * frame);
+		}
+		// The tracker is stuck at pair 10: 11, 12 and 13 wait.
+		CHECK(xreal_air_behind_skip(&b, true, 10 * frame));
+		CHECK(b.last_pending == 3);
+		CHECK(xreal_air_behind_skip(&b, true, 10 * frame));
+		CHECK_FALSE(xreal_air_behind_skip(&b, true, 10 * frame));
+		xreal_air_behind_pushed(&b, 16 * frame);
+		CHECK(xreal_air_behind_skip(&b, true, 10 * frame));
+		CHECK(b.skipped == 3);
+		// Caught up.
+		CHECK_FALSE(xreal_air_behind_skip(&b, true, 13 * frame));
+		CHECK(b.in_row == 0);
+
+		// A new tracker starts afresh: nothing pending.
+		xreal_air_behind_restart(&b);
+		CHECK_FALSE(xreal_air_behind_skip(&b, true, 0));
+		CHECK(b.skipped == 3);
+	}
+}
+
 TEST_CASE("xreal_air_pose_blend_hold")
 {
 	const int64_t s = 1000000000;

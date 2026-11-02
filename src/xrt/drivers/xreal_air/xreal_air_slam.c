@@ -174,6 +174,7 @@ DEBUG_GET_ONCE_NUM_OPTION(xreal_air_slam_stale_ms, "XREAL_AIR_SLAM_STALE_MS", 30
 DEBUG_GET_ONCE_NUM_OPTION(xreal_air_slam_fresh_ms, "XREAL_AIR_SLAM_FRESH_MS", 250)
 DEBUG_GET_ONCE_NUM_OPTION(xreal_air_slam_fresh_hold_ms, "XREAL_AIR_SLAM_FRESH_HOLD_MS", 250)
 DEBUG_GET_ONCE_NUM_OPTION(xreal_air_slam_warmup_ms, "XREAL_AIR_SLAM_WARMUP_MS", 1500)
+DEBUG_GET_ONCE_NUM_OPTION(xreal_air_slam_max_pending, "XREAL_AIR_SLAM_MAX_PENDING", 3)
 DEBUG_GET_ONCE_FLOAT_OPTION(xreal_air_slam_kb4_step_px, "XREAL_AIR_SLAM_KB4_STEP_PX", 8.0f)
 DEBUG_GET_ONCE_BOOL_OPTION(xreal_air_slam_wear, "XREAL_AIR_SLAM_WEAR", true)
 DEBUG_GET_ONCE_NUM_OPTION(xreal_air_slam_wear_debounce_ms, "XREAL_AIR_SLAM_WEAR_DEBOUNCE_MS", 400)
@@ -227,6 +228,17 @@ DEBUG_GET_ONCE_OPTION(xreal_air_planes_dump, "XREAL_AIR_PLANES_DUMP", NULL)
  */
 #define STILL_GYRO_MAX 0.03f
 #define STILL_ACCEL_RANGE 0.15f
+
+/*!
+ * Behind (XREAL_AIR_SLAM_MAX_PENDING, see @ref xreal_air_behind): a pair is not pushed while this many
+ * pushed pairs still have no pose, so a tracker short of CPU sees fewer frames instead of queueing
+ * them. Basalt queues up to 10 pairs and then blocks the camera thread (the kernel drops frames
+ * meanwhile), so a backlog costs a third of a second of pose latency, which the guard then calls a
+ * loss. Never more than this many pairs in a row (the tracker always gets 1 in 3) ...
+ */
+#define BEHIND_MAX_DROPS_IN_A_ROW 2
+//! ... and not when the newest pose is older than this: then the tracker is (re)initialising.
+#define BEHIND_LAG_CEILING_NS ((int64_t)1 * U_TIME_1S_IN_NS)
 
 //! Frames are only pushed once the tracker has had IMU samples for this long before them.
 #define FIRST_FRAME_IMU_LEAD_NS ((int64_t)100 * U_TIME_1MS_IN_NS)
@@ -346,6 +358,7 @@ struct xreal_air_slam
 	struct os_mutex push_lock;
 	bool push_enabled;
 	struct xrt_slam_sinks *push_sinks;
+	struct xrt_tracked_slam *push_xts; //!< The tracker @ref push_sinks belong to.
 	//! Reset in place: poses older than this may be from the old world (atomic; 0 = no gate).
 	int64_t gate_ts;
 	//! Frames still to push before @ref gate_ts is known (atomic).
@@ -354,6 +367,7 @@ struct xreal_air_slam
 	// Camera thread only.
 	int64_t last_frame_ts;
 	int64_t cam_offset_ns;
+	struct xreal_air_behind behind; //!< Pairs left out while the tracker is behind.
 
 	/*!
 	 * Plane detection (XREAL_AIR_PLANES=1). The detector is created with the calibration on the
@@ -825,6 +839,8 @@ create_tracker(struct xreal_air_slam *s, struct xrt_slam_sinks **out_sinks)
 
 	os_mutex_lock(&s->push_lock);
 	s->push_sinks = sinks;
+	s->push_xts = xts;
+	xreal_air_behind_restart(&s->behind);
 	s->push_enabled = true;
 	__atomic_store_n(&s->gate_frames_left, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&s->gate_ts, 0, __ATOMIC_RELEASE);
@@ -845,6 +861,7 @@ restart_tracker(struct xreal_air_slam *s, bool want, const char *reason, struct 
 	os_mutex_lock(&s->push_lock);
 	s->push_enabled = false;
 	s->push_sinks = NULL;
+	s->push_xts = NULL;
 	os_mutex_unlock(&s->push_lock);
 	*inout_sinks = NULL;
 
@@ -1093,6 +1110,9 @@ request_restart_locked(struct xreal_air_slam *s, int64_t now_ns, const char *rea
 static void
 poll_wear_locked(struct xreal_air_slam *s, int64_t now);
 
+static bool
+tracker_behind(struct xreal_air_slam *s, int64_t timestamp_ns);
+
 struct xreal_air_slam *
 xreal_air_slam_create(enum u_logging_level log_level)
 {
@@ -1105,6 +1125,9 @@ xreal_air_slam_create(enum u_logging_level log_level)
 	s->imu_queue = U_TYPED_ARRAY_CALLOC(struct xrt_imu_sample, IMU_QUEUE_SIZE);
 	s->last_frame_ts = INT64_MIN;
 	s->cam_offset_ns = (int64_t)debug_get_num_option_xreal_air_slam_cam_offset_us() * U_TIME_1US_IN_NS;
+	const long max_pending = debug_get_num_option_xreal_air_slam_max_pending();
+	xreal_air_behind_init(&s->behind, max_pending > 0 ? (uint32_t)max_pending : 0, BEHIND_LAG_CEILING_NS,
+	                      BEHIND_MAX_DROPS_IN_A_ROW);
 	s->want_tracker = true;
 	s->use_wear = debug_get_bool_option_xreal_air_slam_wear();
 	s->allow_recreate = debug_get_bool_option_xreal_air_slam_recreate();
@@ -1146,6 +1169,7 @@ xreal_air_slam_create(enum u_logging_level log_level)
 	u_var_add_ro_u64(s, &s->stats.imu_pushed, "IMU samples pushed");
 	u_var_add_ro_u64(s, &s->stats.imu_dropped, "IMU samples dropped");
 	u_var_add_ro_u64(s, &s->stats.pairs_pushed, "Stereo pairs pushed");
+	u_var_add_ro_u64(s, &s->behind.skipped, "Stereo pairs skipped (tracker behind)");
 	u_var_add_ro_u64(s, &s->stats.pairs_out_of_order, "Stereo pairs out of order");
 	u_var_add_ro_u64(s, &s->stats.discontinuities, "Tracker re-initialisations");
 	u_var_add_ro_u64(s, &s->stats.divergences, "Tracker divergences");
@@ -1158,12 +1182,17 @@ xreal_air_slam_create(enum u_logging_level log_level)
 	u_var_add_bool(s, &s->tracking, "Tracking (read only)");
 	u_var_add_pose(s, &s->blend.last_out, "Last head pose");
 
+	char lag_desc[48] = "never behind (off)";
+	if (s->behind.max_pending > 0) {
+		(void)snprintf(lag_desc, sizeof(lag_desc), "%u pairs behind", s->behind.max_pending);
+	}
 	SLAM_NOTE(
 	    s,
 	    "6DoF requested (XREAL_AIR_SLAM=1), the tracker starts once the factory calibration is in. "
-	    "Mid-exposure frame stamps%s, lost after %" PRId64 " ms without a pose (back under %" PRId64
-	    " ms for %" PRId64 " ms), warm-up %" PRId64 " ms, %s, divergence detection %s",
-	    s->cam_offset_ns != 0 ? " plus an extra offset" : "", cfg.stale_ns / U_TIME_1MS_IN_NS,
+	    "Mid-exposure frame stamps%s, pairs skipped while the tracker is %s, lost after %" PRId64
+	    " ms without a pose (back under %" PRId64 " ms for %" PRId64 " ms), warm-up %" PRId64
+	    " ms, %s, divergence detection %s",
+	    s->cam_offset_ns != 0 ? " plus an extra offset" : "", lag_desc, cfg.stale_ns / U_TIME_1MS_IN_NS,
 	    cfg.fresh_ns / U_TIME_1MS_IN_NS, cfg.fresh_hold_ns / U_TIME_1MS_IN_NS, cfg.warmup_ns / U_TIME_1MS_IN_NS,
 	    s->use_wear ? "paused while the glasses are off" : "ignoring the wear sensor", divergence ? "on" : "off");
 
@@ -1267,6 +1296,11 @@ xreal_air_slam_push_stereo(struct xreal_air_slam *s,
 	}
 	s->last_frame_ts = timestamp_ns;
 
+	if (tracker_behind(s, timestamp_ns)) {
+		os_mutex_unlock(&s->push_lock);
+		return;
+	}
+
 	// The frames are only read by the capture's own sinks otherwise, which are done with them.
 	left->timestamp = (uint64_t)timestamp_ns;
 	right->timestamp = (uint64_t)timestamp_ns;
@@ -1274,6 +1308,7 @@ xreal_air_slam_push_stereo(struct xreal_air_slam *s,
 	// Always both, in this order: Basalt expects cam0 then cam1 with the same timestamp.
 	xrt_sink_push_frame(sinks->cams[0], left);
 	xrt_sink_push_frame(sinks->cams[1], right);
+	xreal_air_behind_pushed(&s->behind, timestamp_ns);
 
 	// The plane detector keeps a few of them (references, it never blocks).
 	struct t_plane_detector *planes = planes_get(s);
@@ -1290,6 +1325,33 @@ xreal_air_slam_push_stereo(struct xreal_air_slam *s,
 		SLAM_NOTE(s, "First stereo pair pushed to the tracker");
 	}
 	os_mutex_unlock(&s->push_lock);
+}
+
+/*!
+ * Camera thread, with @ref xreal_air_slam::push_lock held: whether to skip the pair at @p timestamp_ns
+ * because the tracker is behind (see @ref xreal_air_behind).
+ */
+static bool
+tracker_behind(struct xreal_air_slam *s, int64_t timestamp_ns)
+{
+	(void)timestamp_ns;
+	if (s->push_xts == NULL) {
+		return false;
+	}
+
+	timepoint_ns latest_ts = 0;
+	struct xrt_space_relation latest = XRT_SPACE_RELATION_ZERO;
+	const bool have = s->behind.max_pending > 0 && t_slam_get_latest_pose(s->push_xts, &latest_ts, &latest);
+	if (!xreal_air_behind_skip(&s->behind, have, latest_ts)) {
+		return false;
+	}
+	if (s->behind.skipped == 1) {
+		SLAM_NOTE(s,
+		          "The tracker is behind (%u pushed pairs without a pose): skipping pairs instead of "
+		          "queueing them (only counted from now)",
+		          s->behind.last_pending);
+	}
+	return true;
 }
 
 //! Called with the lock held: log and act on what the guard made of a new SLAM pose.
@@ -1568,15 +1630,18 @@ xreal_air_slam_destroy(struct xreal_air_slam **s_ptr)
 
 	SLAM_NOTE(s,
 	          "%" PRIu64 " IMU samples and %" PRIu64 " stereo pairs pushed, %" PRIu64
-	          " IMU samples dropped, %" PRIu64 " pairs out of order, %" PRIu64 " re-initialisations, %" PRIu64
-	          " divergences, %" PRIu64 " restarts, taken off %" PRIu64 " times, SLAM acquired %u / lost %u times",
-	          s->stats.imu_pushed, s->stats.pairs_pushed, s->stats.imu_dropped, s->stats.pairs_out_of_order,
+	          " IMU samples dropped, %" PRIu64 " pairs skipped (tracker behind), %" PRIu64
+	          " pairs out of order, %" PRIu64 " re-initialisations, %" PRIu64 " divergences, %" PRIu64
+	          " restarts, taken off %" PRIu64 " times, SLAM acquired %u / lost %u times",
+	          s->stats.imu_pushed, s->stats.pairs_pushed, s->stats.imu_dropped, s->behind.skipped,
+	          s->stats.pairs_out_of_order,
 	          s->stats.discontinuities, s->stats.divergences, s->stats.restarts, s->stats.doffs,
 	          s->blend.slam_acquired, s->blend.slam_lost);
 
 	os_mutex_lock(&s->push_lock);
 	s->push_enabled = false;
 	s->push_sinks = NULL;
+	s->push_xts = NULL;
 	os_mutex_unlock(&s->push_lock);
 
 	os_mutex_lock(&s->lock);

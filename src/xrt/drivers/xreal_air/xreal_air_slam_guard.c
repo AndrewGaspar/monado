@@ -360,6 +360,64 @@ xreal_air_slam_guard_usable(struct xreal_air_slam_guard *g, int64_t now_ns, int6
 
 /*
  *
+ * Frame skipping while the tracker is behind.
+ *
+ */
+
+void
+xreal_air_behind_init(struct xreal_air_behind *b, uint32_t max_pending, int64_t ceiling_ns, uint32_t max_in_row)
+{
+	memset(b, 0, sizeof(*b));
+	b->max_pending = max_pending < XREAL_AIR_BEHIND_RING ? max_pending : XREAL_AIR_BEHIND_RING - 1;
+	b->ceiling_ns = ceiling_ns;
+	b->max_in_row = max_in_row;
+}
+
+bool
+xreal_air_behind_skip(struct xreal_air_behind *b, bool have_pose, int64_t newest_pose_ts)
+{
+	uint32_t pending = 0;
+	int64_t newest_pushed = INT64_MIN;
+	const uint32_t n = b->pushed_count < XREAL_AIR_BEHIND_RING ? b->pushed_count : XREAL_AIR_BEHIND_RING;
+	for (uint32_t k = 0; k < n; k++) {
+		const int64_t ts = b->pushed_ts[(b->pushed_count - 1 - k) % XREAL_AIR_BEHIND_RING];
+		if (k == 0) {
+			newest_pushed = ts;
+		}
+		if (ts <= newest_pose_ts) {
+			break; // Pushed in order: everything older has its pose too.
+		}
+		pending++;
+	}
+	b->last_pending = have_pose ? pending : 0;
+
+	if (b->max_pending == 0 || !have_pose || pending < b->max_pending ||
+	    newest_pushed - newest_pose_ts > b->ceiling_ns || b->in_row >= b->max_in_row) {
+		b->in_row = 0;
+		return false;
+	}
+	b->in_row++;
+	b->skipped++;
+	return true;
+}
+
+void
+xreal_air_behind_pushed(struct xreal_air_behind *b, int64_t pair_ts)
+{
+	b->pushed_ts[b->pushed_count % XREAL_AIR_BEHIND_RING] = pair_ts;
+	b->pushed_count++;
+}
+
+void
+xreal_air_behind_restart(struct xreal_air_behind *b)
+{
+	b->in_row = 0;
+	b->pushed_count = 0;
+}
+
+
+/*
+ *
  * Position history.
  *
  */

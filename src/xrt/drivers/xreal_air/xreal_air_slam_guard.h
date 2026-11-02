@@ -246,6 +246,60 @@ xreal_air_slam_guard_usable(struct xreal_air_slam_guard *g, int64_t now_ns, int6
 
 /*
  *
+ * Frame skipping while the tracker is behind.
+ *
+ */
+
+/*!
+ * Basalt queues every frame (10 deep, then the push blocks the camera thread), so a tracker short of
+ * CPU turns a load spike into a third of a second of pose latency, and the guard into a loss. This
+ * decides per stereo pair whether to leave it out instead: when @ref max_pending pairs pushed
+ * earlier still have no pose (the tracker is busy with one and the next is queued), at most
+ * @ref max_in_row pairs in a row (the tracker always gets some), and not while the newest pose is
+ * older than the newest pushed pair by more than @ref ceiling_ns (the tracker is starting or
+ * re-initialising, not behind).
+ *
+ * Counting pairs, not comparing the new pair's time with the newest pose: after a gap in the camera
+ * stream (USB, the kernel dropping frames) the new pair is far newer than the newest pose although
+ * the tracker has nothing left to do, and skipping it would only widen the gap.
+ */
+#define XREAL_AIR_BEHIND_RING 16
+
+struct xreal_air_behind
+{
+	uint32_t max_pending; //!< 0: never skip.
+	int64_t ceiling_ns;
+	uint32_t max_in_row;
+
+	int64_t pushed_ts[XREAL_AIR_BEHIND_RING]; //!< The last pairs pushed, a ring.
+	uint32_t pushed_count;                    //!< Total pushed (index of the next slot).
+
+	uint32_t in_row;      //!< Pairs skipped in a row so far.
+	uint64_t skipped;     //!< Pairs skipped in total.
+	uint32_t last_pending; //!< For logs.
+};
+
+void
+xreal_air_behind_init(struct xreal_air_behind *b, uint32_t max_pending, int64_t ceiling_ns, uint32_t max_in_row);
+
+/*!
+ * Whether to skip the next pair. @p have_pose false when the tracker has no pose yet, else
+ * @p newest_pose_ts is the newest one's timestamp.
+ */
+bool
+xreal_air_behind_skip(struct xreal_air_behind *b, bool have_pose, int64_t newest_pose_ts);
+
+//! A pair at @p pair_ts was pushed to the tracker.
+void
+xreal_air_behind_pushed(struct xreal_air_behind *b, int64_t pair_ts);
+
+//! A new tracker: start counting afresh (the total stays).
+void
+xreal_air_behind_restart(struct xreal_air_behind *b);
+
+
+/*
+ *
  * Position history.
  *
  */
