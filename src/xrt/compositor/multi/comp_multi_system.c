@@ -26,7 +26,7 @@
 #include "util/u_distortion_mesh.h"
 
 #ifdef XRT_OS_LINUX
-#include "util/u_linux.h"
+#include "util/u_linux_realtime.h"
 #endif
 
 #include "multi/comp_multi_private.h"
@@ -45,15 +45,25 @@
 
 
 /*
- * Gate the SCHED_FIFO (priority 99) promotion of the multi-client render thread.
+ * Gate the real-time promotion of the multi-client render thread. Default: off.
  *
- * u_linux_try_to_set_realtime_priority_on_thread() raises this thread to the
- * maximum realtime priority. That only succeeds once the process has CAP_SYS_NICE
- * (e.g. monado-service with cap_sys_nice+ep), and a priority-99 SCHED_FIFO thread
- * can starve the rest of the machine. Companion to the Vulkan global-priority cap
- * in comp_vulkan.c (2026-07-15 shared-iGPU starvation incident). Default: off.
+ * When on, the thread asks for XRT_COMPOSITOR_THREAD_RT_PRIORITY through
+ * u_linux_try_to_set_bounded_realtime_priority_on_thread(): rtkit first (no file
+ * capabilities needed, and rtkit's watchdog demotes a runaway thread), then
+ * pthread_setschedparam() (needs CAP_SYS_NICE or RLIMIT_RTPRIO). It used to ask for
+ * SCHED_FIFO at the maximum priority (99), which only worked with CAP_SYS_NICE and
+ * could starve the rest of the machine. Companion to the Vulkan global-priority cap
+ * in comp_vulkan.c (2026-07-15 shared-iGPU starvation incident).
  */
 DEBUG_GET_ONCE_BOOL_OPTION(thread_realtime, "XRT_COMPOSITOR_THREAD_REALTIME", false)
+
+/*
+ * Real-time priority the render thread asks for when XRT_COMPOSITOR_THREAD_REALTIME
+ * is on. Kept low: nothing in the frame loop needs to preempt kernel threads (IRQ
+ * threads run at 50) or audio, it only has to win against normal (SCHED_OTHER)
+ * work. rtkit clamps it to its MaxRealtimePriority (20 by default).
+ */
+DEBUG_GET_ONCE_NUM_OPTION(thread_rt_priority, "XRT_COMPOSITOR_THREAD_RT_PRIORITY", 10)
 
 /*
  * Decouple the user-presence (XR_EXT_user_presence) poll from the native render loop.
@@ -630,13 +640,16 @@ multi_main_loop(struct multi_system_compositor *msc)
 	os_thread_helper_name(&msc->oth, "Multi Client Module");
 
 #ifdef XRT_OS_LINUX
-	// Try to raise priority of this thread -- but only when explicitly opted in. A
-	// SCHED_FIFO priority-99 thread on a cap_sys_nice binary can starve the whole
-	// machine (see XRT_COMPOSITOR_THREAD_REALTIME above).
+	// Try to raise priority of this thread -- but only when explicitly opted in, and
+	// only to a bounded priority (see XRT_COMPOSITOR_THREAD_REALTIME above). Logs the
+	// outcome once at warn level.
 	if (debug_get_bool_option_thread_realtime()) {
-		u_linux_try_to_set_realtime_priority_on_thread(U_LOGGING_INFO, "Multi Client Module");
+		u_linux_try_to_set_bounded_realtime_priority_on_thread( //
+		    U_LOGGING_INFO,                                     //
+		    "Multi Client Module",                              //
+		    (int)debug_get_num_option_thread_rt_priority());    //
 	} else {
-		U_LOG_I("Multi Client Module: SCHED_FIFO promotion skipped "
+		U_LOG_I("Multi Client Module: real-time promotion skipped "
 		        "(set XRT_COMPOSITOR_THREAD_REALTIME=true to enable).");
 	}
 #endif

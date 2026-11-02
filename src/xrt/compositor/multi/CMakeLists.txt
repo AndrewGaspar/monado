@@ -15,3 +15,7 @@ target_link_libraries(
 	PUBLIC xrt-interfaces comp_includes
 	PRIVATE aux_util aux_os
 	)
+
+if(XRT_HAVE_LINUX OR ANDROID)
+	target_link_libraries(comp_multi PRIVATE aux_util_linux_realtime)
+endif()
