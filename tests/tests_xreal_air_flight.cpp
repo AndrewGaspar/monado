@@ -564,3 +564,223 @@ TEST_CASE("flight_capture_refusals_and_limits")
 		CHECK(frames.pairs <= feed.pairs - before);
 	}
 }
+
+
+/*
+ *
+ * Cost measurement on recorded data, hidden: run by hand with
+ *   XREAL_FLIGHT_BENCH_FRAMES=frames.raw  (N x 2 x 480x640 L8, left then right)
+ *   XREAL_FLIGHT_BENCH_TS=frames.ts       (N EuRoC timestamps, one per line)
+ *   XREAL_FLIGHT_BENCH_EUROC=<dataset>    (mav0/imu0/data.csv, xreal/factory_calibration.json)
+ *   XREAL_FLIGHT_BENCH_MODE=idle|zstd|raw|png|noflight   XREAL_FLIGHT_BENCH_OUT=<empty dir>
+ *   XREAL_FLIGHT_BENCH_ARM_S=0            frame look-back armed before the capture starts
+ *   tests_xreal_air_flight "[.bench]"
+ * Feeds the pairs and the IMU between them at their recorded rate (1x), as the driver would. In the
+ * flight modes the capture starts halfway through with look-back, so the whole slice is recorded;
+ * png is the existing XREAL_AIR_EUROC_RECORD writer. Prints the process CPU per second of data.
+ *
+ */
+
+#include <sys/resource.h>
+
+namespace {
+
+double
+process_cpu_s()
+{
+	rusage ru{};
+	getrusage(RUSAGE_SELF, &ru);
+	return (double)ru.ru_utime.tv_sec + ru.ru_utime.tv_usec * 1e-6 + (double)ru.ru_stime.tv_sec +
+	       ru.ru_stime.tv_usec * 1e-6;
+}
+
+long
+rss_kb()
+{
+	std::ifstream in("/proc/self/status");
+	std::string line;
+	while (std::getline(in, line)) {
+		if (line.rfind("VmRSS:", 0) == 0) {
+			return std::stol(line.substr(6));
+		}
+	}
+	return -1;
+}
+
+std::string
+env_or(const char *name, const char *fallback)
+{
+	const char *v = std::getenv(name);
+	return v != nullptr ? v : fallback;
+}
+
+} // namespace
+
+TEST_CASE("flight_bench", "[.bench]")
+{
+	const std::string frames_path = env_or("XREAL_FLIGHT_BENCH_FRAMES", "");
+	const std::string euroc = env_or("XREAL_FLIGHT_BENCH_EUROC", "");
+	const std::string mode = env_or("XREAL_FLIGHT_BENCH_MODE", "zstd");
+	const std::string out_root = env_or("XREAL_FLIGHT_BENCH_OUT", "");
+	const int arm_s = std::atoi(env_or("XREAL_FLIGHT_BENCH_ARM_S", "0").c_str());
+	REQUIRE(!frames_path.empty());
+	REQUIRE(!euroc.empty());
+	REQUIRE(!out_root.empty());
+
+	const std::string pixels = slurp(frames_path);
+	std::vector<int64_t> pair_ts;
+	{
+		std::ifstream in(env_or("XREAL_FLIGHT_BENCH_TS", ""));
+		std::string line;
+		while (std::getline(in, line)) {
+			pair_ts.push_back(std::stoll(line));
+		}
+	}
+	const size_t image = 480 * 640;
+	REQUIRE(pixels.size() == pair_ts.size() * 2 * image);
+
+	struct ImuRow
+	{
+		int64_t ts;
+		float w[3], a[3];
+	};
+	std::vector<ImuRow> imu;
+	{
+		std::ifstream in(euroc + "/mav0/imu0/data.csv");
+		std::string line;
+		while (std::getline(in, line)) {
+			ImuRow r{};
+			long long ts = 0;
+			if (sscanf(line.c_str(), "%lld,%f,%f,%f,%f,%f,%f", &ts, &r.w[0], &r.w[1], &r.w[2], &r.a[0],
+			           &r.a[1], &r.a[2]) == 7 &&
+			    ts >= pair_ts.front() - 200000000 && ts <= pair_ts.back()) {
+				r.ts = ts;
+				imu.push_back(r);
+			}
+		}
+	}
+	REQUIRE(imu.size() > 1000);
+	const std::string calib_doc = slurp(euroc + "/xreal/factory_calibration.json");
+
+	xreal_air_flight *f = nullptr;
+	xreal_air_record *record = nullptr;
+	std::string ctl = out_root + "/ctl";
+	const bool flight = mode == "idle" || mode == "zstd" || mode == "raw";
+	if (flight) {
+		xreal_air_flight_config cfg{};
+		cfg.log_level = U_LOGGING_WARN;
+		snprintf(cfg.ctl_dir, sizeof(cfg.ctl_dir), "%s", ctl.c_str());
+		cfg.lookback_s = 60;
+		cfg.frames_lookback_s = (uint32_t)arm_s;
+		cfg.min_free_mb = 0;
+		cfg.max_mb = 4096;
+		cfg.default_max_s = 600;
+		cfg.writer_nice = 10;
+		f = xreal_air_flight_create(&cfg);
+		REQUIRE(f != nullptr);
+		xreal_air_parsed_calibration calib{};
+		xreal_air_flight_set_calibration(f, calib_doc.data(), calib_doc.size(), &calib);
+	} else if (mode == "png") {
+		record = xreal_air_record_create((out_root + "/cap").c_str(), U_LOGGING_WARN);
+		REQUIRE(record != nullptr);
+	}
+
+	auto drop = [&](const std::string &name, const std::string &body) {
+		std::ofstream(ctl + "/." + name) << body << "\n";
+		REQUIRE(rename((ctl + "/." + name).c_str(), (ctl + "/" + name).c_str()) == 0);
+	};
+
+	const long rss0 = rss_kb();
+	const double cpu0 = process_cpu_s();
+	const int64_t t0 = (int64_t)os_monotonic_get_ns();
+	const int64_t data0 = imu.front().ts;
+	const double start_frac = std::atof(env_or("XREAL_FLIGHT_BENCH_START", "0.5").c_str());
+	const size_t start_at = (size_t)(start_frac * (double)pair_ts.size());
+	// The recording's clock onto ours, as the driver's mapping does it live (the look-back cut-off
+	// compares EuRoC times with now).
+	const int64_t shift = t0 - data0;
+	long rss_peak = rss0;
+	size_t next_imu = 0;
+	for (size_t p = 0; p < pair_ts.size(); p++) {
+		// The IMU samples up to this pair, each at its recorded time.
+		while (next_imu < imu.size() && imu[next_imu].ts <= pair_ts[p]) {
+			const ImuRow &r = imu[next_imu++];
+			const int64_t due = t0 + (r.ts - data0);
+			int64_t now = (int64_t)os_monotonic_get_ns();
+			if (due > now) {
+				std::this_thread::sleep_for(std::chrono::nanoseconds(due - now));
+				now = (int64_t)os_monotonic_get_ns();
+			}
+			xreal_air_record_imu s{};
+			s.host_ns = now;
+			s.device_ts = (uint64_t)r.ts;
+			s.fusion_ns = now;
+			s.euroc_ns = r.ts + shift;
+			s.gyro = {r.w[0], r.w[1], r.w[2]};
+			s.accel = {r.a[0], r.a[1], r.a[2]};
+			if (f != nullptr) {
+				xreal_air_flight_push_imu(f, &s);
+				xreal_air_flight_head head{};
+				head.query_ns = now;
+				head.at_ns = now;
+				head.pose.orientation.w = 1;
+				head.fusion.w = 1;
+				xreal_air_flight_push_head(f, &head);
+			} else if (record != nullptr) {
+				xreal_air_record_push_imu(record, &s);
+			}
+		}
+
+		const int64_t now = (int64_t)os_monotonic_get_ns();
+		xrt_frame *frames[2] = {nullptr, nullptr};
+		for (int c = 0; c < 2; c++) {
+			u_frame_create_one_off(XRT_FORMAT_L8, 480, 640, &frames[c]);
+			memcpy(frames[c]->data, pixels.data() + (p * 2 + c) * image, image);
+			xreal_air_record_cam_frame row{};
+			row.cam = (xreal_air_cam_id)c;
+			row.kernel_ns = now;
+			row.dequeue_ns = now;
+			row.euroc_ns = pair_ts[p] + shift;
+			row.telemetry.exposure = 8000000;
+			if (f != nullptr) {
+				xreal_air_flight_push_cam_frame(f, &row);
+			} else if (record != nullptr) {
+				xreal_air_record_push_cam_frame(record, &row);
+			}
+		}
+		if (f != nullptr) {
+			xreal_air_flight_push_stereo(f, pair_ts[p] + shift, frames[0], frames[1]);
+		} else if (record != nullptr) {
+			xreal_air_record_push_stereo(record, pair_ts[p] + shift, frames[0], frames[1]);
+		}
+		xrt_frame_reference(&frames[0], nullptr);
+		xrt_frame_reference(&frames[1], nullptr);
+
+		if (p == start_at && f != nullptr && mode != "idle") {
+			drop("start", "out=" + out_root + "/cap\ncodec=" + mode + "\nlookback_s=60");
+		}
+		rss_peak = std::max(rss_peak, rss_kb());
+	}
+	if (f != nullptr && mode != "idle") {
+		drop("stop", "reason=bench");
+	}
+	// Let the writers finish what they have, then stop.
+	if (f != nullptr) {
+		for (int i = 0; i < 600 && mode != "idle"; i++) {
+			if (key_values(slurp(ctl + "/status"))["state"] == "idle") {
+				break;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+		xreal_air_flight_destroy(&f);
+	}
+	xreal_air_record_destroy(&record);
+	const double cpu = process_cpu_s() - cpu0;
+	const double data_s = (double)(pair_ts.back() - data0) * 1e-9;
+
+	printf(
+	    "BENCH mode=%s arm_s=%d pairs=%zu imu=%zu data=%.1f s cpu=%.3f s -> %.1f ms CPU per s; rss +%.1f MB "
+	    "peak\n",
+	    mode.c_str(), arm_s, pair_ts.size(), imu.size(), data_s, cpu, cpu / data_s * 1e3,
+	    (double)(rss_peak - rss0) / 1024.0);
+}
