@@ -16,6 +16,8 @@
  *  - XREAL_AIR_CAMERA_DEVICE=/dev/vN  Override the camera node, found by USB id otherwise.
  *  - XREAL_AIR_SLAM=1                 Implies cameras, feeds the 6DoF tracker (xreal_air_slam.h).
  *
+ * With the cameras on, the flight recorder (xreal_air_flight.h) records on demand at runtime.
+ *
  * @author Andrew Gaspar
  * @ingroup drv_xreal_air
  */
@@ -33,13 +35,19 @@ extern "C" {
 struct xreal_air_capture;
 
 struct xreal_air_slam;
+struct xreal_air_flight;
+
+//! Whether @ref xreal_air_capture_create would create a capture (the environment asks, or @p slam).
+bool
+xreal_air_capture_wanted(struct xreal_air_slam *slam);
 
 /*!
  * Create the capture if enabled by the environment or @p slam is given, NULL otherwise (or on
- * failure). @p slam (may be NULL, not owned) gets the IMU samples and stereo pairs.
+ * failure). @p slam (may be NULL, not owned) gets the IMU samples and stereo pairs, @p flight (may be
+ * NULL, not owned) the flight recorder's IMU, camera telemetry and stereo pairs.
  */
 struct xreal_air_capture *
-xreal_air_capture_create(enum u_logging_level log_level, struct xreal_air_slam *slam);
+xreal_air_capture_create(enum u_logging_level log_level, struct xreal_air_slam *slam, struct xreal_air_flight *flight);
 
 /*!
  * The factory calibration arrived, @p buffer is the reassembled HID blob.

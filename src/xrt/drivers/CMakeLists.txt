@@ -143,6 +143,10 @@ if(XRT_BUILD_DRIVER_XREAL_AIR)
 			xreal_air/xreal_air_capture.c
 			xreal_air/xreal_air_record.h
 			xreal_air/xreal_air_record.c
+			xreal_air/xreal_air_flight.h
+			xreal_air/xreal_air_flight.c
+			xreal_air/xreal_air_flight_ring.h
+			xreal_air/xreal_air_flight_ring.c
 		)
 	# Opt-in 6DoF (XREAL_AIR_SLAM=1) through t_slam / VIT, stubbed out without XRT_FEATURE_SLAM.
 	target_sources(
@@ -161,6 +165,14 @@ if(XRT_BUILD_DRIVER_XREAL_AIR)
 		target_link_libraries(drv_xreal_air PRIVATE ${ZLIB_LIBRARIES})
 		target_include_directories(drv_xreal_air PRIVATE ${ZLIB_INCLUDE_DIRS})
 		target_compile_definitions(drv_xreal_air PRIVATE XREAL_AIR_HAVE_ZLIB)
+	endif()
+	# Optional: zstd for the flight recorder's stereo frames (raw without it).
+	if(PKG_CONFIG_FOUND)
+		pkg_check_modules(XREAL_AIR_ZSTD IMPORTED_TARGET libzstd)
+	endif()
+	if(XREAL_AIR_ZSTD_FOUND)
+		target_link_libraries(drv_xreal_air PRIVATE PkgConfig::XREAL_AIR_ZSTD)
+		target_compile_definitions(drv_xreal_air PRIVATE XREAL_AIR_HAVE_ZSTD)
 	endif()
 	list(APPEND ENABLED_HEADSET_DRIVERS xreal_air)
 endif()

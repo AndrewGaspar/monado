@@ -99,6 +99,15 @@ xreal_air_slam_requested(void);
 struct xreal_air_slam *
 xreal_air_slam_create(enum u_logging_level log_level);
 
+struct xreal_air_flight;
+
+/*!
+ * Report the SLAM poses, their pipeline timing, the head poses handed out and the state changes to
+ * the flight recorder @p flight (not owned, outlives @p s). Call right after create.
+ */
+void
+xreal_air_slam_set_flight(struct xreal_air_slam *s, struct xreal_air_flight *flight);
+
 /*!
  * The factory calibration arrived. Converts it and creates the tracker on the SLAM's own thread,
  * never blocks the caller.

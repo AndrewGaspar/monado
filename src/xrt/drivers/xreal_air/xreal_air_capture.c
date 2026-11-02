@@ -11,6 +11,7 @@
 #include "xreal_air_camera.h"
 #include "xreal_air_camera_decode.h"
 #include "xreal_air_camera_pairing.h"
+#include "xreal_air_flight.h"
 #include "xreal_air_record.h"
 #include "xreal_air_slam.h"
 
@@ -82,6 +83,9 @@ struct xreal_air_capture
 
 	//! The 6DoF tracker fed with the IMU samples and stereo pairs, not owned, may be NULL.
 	struct xreal_air_slam *slam;
+
+	//! The flight recorder, not owned, may be NULL.
+	struct xreal_air_flight *flight;
 
 	//! Opens the camera (retrying until it shows up), then idles until destroyed.
 	struct os_thread_helper oth;
@@ -319,6 +323,10 @@ on_unpaired(void *ctx, void *item)
 	}
 	os_mutex_unlock(&cap->lock);
 
+	if (cap->flight != NULL) {
+		xreal_air_flight_push_cam_frame(cap->flight, &it->info);
+	}
+
 	free_pair_item(it);
 }
 
@@ -338,20 +346,33 @@ on_pair(void *ctx, void *left_item, void *right_item)
 		cap->gui.warmup++;
 	}
 
-	os_mutex_lock(&cap->lock);
-	if (cap->record != NULL && !warmup && pair_ns > cap->last_pair_euroc_ns) {
+	// A pair for the datasets (the recording's and the flight recorder's): exposed, and in order.
+	const bool dataset_pair = !warmup && pair_ns > cap->last_pair_euroc_ns;
+	if (dataset_pair) {
 		items[0]->info.euroc_ns = pair_ns;
 		items[1]->info.euroc_ns = pair_ns;
-		xreal_air_record_push_stereo(cap->record, pair_ns, items[0]->frame, items[1]->frame);
 		cap->last_pair_euroc_ns = pair_ns;
-	} else if (cap->record != NULL && !warmup) {
+	} else if (!warmup) {
 		cap->gui.pairs_out_of_order++;
+	}
+
+	os_mutex_lock(&cap->lock);
+	if (cap->record != NULL && dataset_pair) {
+		xreal_air_record_push_stereo(cap->record, pair_ns, items[0]->frame, items[1]->frame);
 	}
 	if (cap->record != NULL) {
 		xreal_air_record_push_cam_frame(cap->record, &items[0]->info);
 		xreal_air_record_push_cam_frame(cap->record, &items[1]->info);
 	}
 	os_mutex_unlock(&cap->lock);
+
+	if (cap->flight != NULL) {
+		if (dataset_pair) {
+			xreal_air_flight_push_stereo(cap->flight, pair_ns, items[0]->frame, items[1]->frame);
+		}
+		xreal_air_flight_push_cam_frame(cap->flight, &items[0]->info);
+		xreal_air_flight_push_cam_frame(cap->flight, &items[1]->info);
+	}
 
 	/*
 	 * Only pairs timed on the IMU's clock: the camera's own mapping is ~26 ms off (its transport
@@ -515,18 +536,27 @@ open_thread(void *ptr)
  *
  */
 
-struct xreal_air_capture *
-xreal_air_capture_create(enum u_logging_level log_level, struct xreal_air_slam *slam)
+bool
+xreal_air_capture_wanted(struct xreal_air_slam *slam)
 {
 	const char *record_path = debug_get_option_xreal_air_euroc_record();
 	const bool record = record_path != NULL && record_path[0] != '\0';
-	if (!record && !debug_get_bool_option_xreal_air_cameras() && slam == NULL) {
+	return record || debug_get_bool_option_xreal_air_cameras() || slam != NULL;
+}
+
+struct xreal_air_capture *
+xreal_air_capture_create(enum u_logging_level log_level, struct xreal_air_slam *slam, struct xreal_air_flight *flight)
+{
+	const char *record_path = debug_get_option_xreal_air_euroc_record();
+	const bool record = record_path != NULL && record_path[0] != '\0';
+	if (!xreal_air_capture_wanted(slam)) {
 		return NULL;
 	}
 
 	struct xreal_air_capture *cap = U_TYPED_CALLOC(struct xreal_air_capture);
 	cap->log_level = log_level;
 	cap->slam = slam;
+	cap->flight = flight;
 	cap->last_imu_euroc_ns = -1;
 	cap->last_pair_euroc_ns = -1;
 	xreal_air_cam_pairer_init(&cap->pairer,
@@ -597,6 +627,9 @@ xreal_air_capture_set_calibration(struct xreal_air_capture *cap,
 	if (cap->record != NULL) {
 		xreal_air_record_set_calibration(cap->record, cap->calib_document, cap->calib_document_len,
 		                                 &cap->calib);
+	}
+	if (cap->flight != NULL) {
+		xreal_air_flight_set_calibration(cap->flight, cap->calib_document, cap->calib_document_len, calib);
 	}
 	os_mutex_unlock(&cap->lock);
 
@@ -675,6 +708,10 @@ xreal_air_capture_push_imu(struct xreal_air_capture *cap,
 	cap->gui.imu_samples++;
 
 	os_mutex_unlock(&cap->lock);
+
+	if (cap->flight != NULL) {
+		xreal_air_flight_push_imu(cap->flight, &imu);
+	}
 
 	// Same clock and frame as the recorded mav0/imu0, never blocks.
 	if (cap->slam != NULL && imu.euroc_ns > 0) {

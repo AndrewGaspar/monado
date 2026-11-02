@@ -52,7 +52,7 @@ endif()
 list(APPEND tests tests_t_plane)
 if(XRT_BUILD_DRIVER_XREAL_AIR)
 	list(APPEND tests tests_xreal_air_camera_decode tests_xreal_air_camera_pairing
-	     tests_xreal_air_gyro_bias_store tests_xreal_air_slam
+	     tests_xreal_air_gyro_bias_store tests_xreal_air_slam tests_xreal_air_flight
 	     )
 endif()
 
@@ -86,6 +86,8 @@ if(XRT_BUILD_DRIVER_XREAL_AIR)
 	target_include_directories(
 		tests_xreal_air_gyro_bias_store PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers
 		)
+	target_link_libraries(tests_xreal_air_flight PRIVATE drv_xreal_air aux_math aux_os)
+	target_include_directories(tests_xreal_air_flight PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers)
 endif()
 
 if(XRT_BUILD_DRIVER_HANDTRACKING)

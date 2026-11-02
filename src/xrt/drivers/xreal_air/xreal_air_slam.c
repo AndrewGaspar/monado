@@ -41,6 +41,13 @@ xreal_air_slam_create(enum u_logging_level log_level)
 }
 
 void
+xreal_air_slam_set_flight(struct xreal_air_slam *s, struct xreal_air_flight *flight)
+{
+	(void)s;
+	(void)flight;
+}
+
+void
 xreal_air_slam_set_calibration(struct xreal_air_slam *s, const struct xreal_air_parsed_calibration *calib)
 {
 	(void)s;
@@ -147,6 +154,7 @@ xreal_air_slam_get_planes_debug(struct xreal_air_slam *s,
 #include "tracking/t_plane_detector.h"
 #include "tracking/t_plane_stereo.h"
 #include "xreal_air_slam_guard.h"
+#include "xreal_air_flight.h"
 
 #include <dlfcn.h>
 #include <inttypes.h>
@@ -188,6 +196,13 @@ DEBUG_GET_ONCE_OPTION(xreal_air_planes_dump, "XREAL_AIR_PLANES_DUMP", NULL)
 // Lifecycle lines at WARN so they show at the driver's default log level.
 #define SLAM_NOTE(s, ...) U_LOG_IFL_W((s)->log_level, "Xreal Air SLAM: " __VA_ARGS__)
 #define SLAM_ERROR(s, ...) U_LOG_IFL_E((s)->log_level, "Xreal Air SLAM: " __VA_ARGS__)
+//! A state change for the flight recorder's events.csv (never rate limited, unlike the log lines).
+#define SLAM_EVENT(s, type, ...)                                                                                       \
+	do {                                                                                                           \
+		if ((s)->flight != NULL) {                                                                             \
+			xreal_air_flight_event((s)->flight, type, __VA_ARGS__);                                        \
+		}                                                                                                      \
+	} while (false)
 
 //! IMU samples queued for the tracker, 4 s at 1 kHz.
 #define IMU_QUEUE_SIZE 4096
@@ -273,6 +288,9 @@ struct teardown_job
 struct xreal_air_slam
 {
 	enum u_logging_level log_level;
+
+	//! The flight recorder (not owned, may be NULL), set before anything runs.
+	struct xreal_air_flight *flight;
 
 	/*!
 	 * Creates, restarts and destroys the tracker, and forwards IMU samples to it. Its lock protects
@@ -674,6 +692,15 @@ mark_failed(struct xreal_air_slam *s)
 	os_mutex_lock(&s->lock);
 	s->failed = true;
 	os_mutex_unlock(&s->lock);
+	SLAM_EVENT(s, "tracker", "failed, 3DoF");
+}
+
+//! t_slam's per-pose pipeline timestamps, to the flight recorder (pose query threads, lock held).
+static void
+flight_timing_cb(void *user, const int64_t *timestamps, uint32_t count)
+{
+	struct xreal_air_slam *s = (struct xreal_air_slam *)user;
+	xreal_air_flight_push_slam_timing(s->flight, timestamps, count);
 }
 
 static void *
@@ -761,6 +788,11 @@ create_tracker(struct xreal_air_slam *s, struct xrt_slam_sinks **out_sinks)
 	}
 	s->stats.last_create_ms = (float)((double)(os_monotonic_get_ns() - t0) / U_TIME_1MS_IN_NS);
 
+	if (s->flight != NULL) {
+		t_slam_set_timing_callback(xts, flight_timing_cb, s);
+		xreal_air_flight_set_timing_columns(s->flight, t_slam_get_timing_columns(xts));
+	}
+
 	if (planes_get(s) != NULL && debug_get_bool_option_xreal_air_planes_landmarks() &&
 	    t_slam_set_features_callback(xts, planes_features_cb, s) != 0) {
 		SLAM_ERROR(s, "The VIT library cannot report landmarks, planes from dense stereo only");
@@ -836,6 +868,7 @@ restart_tracker(struct xreal_air_slam *s, bool want, const char *reason, struct 
 	if (!want) {
 		if (xfctx != NULL) {
 			SLAM_NOTE(s, "Tracker stopped (%s) in %.0f ms", reason, teardown_ms);
+			SLAM_EVENT(s, "tracker", "stopped (%s) in %.0f ms", reason, teardown_ms);
 		}
 		return;
 	}
@@ -848,10 +881,13 @@ restart_tracker(struct xreal_air_slam *s, bool want, const char *reason, struct 
 	if (first) {
 		SLAM_NOTE(s, "Tracker running (created in %.0f ms), waiting for camera frames",
 		          s->stats.last_create_ms);
+		SLAM_EVENT(s, "tracker", "running (created in %.0f ms)", s->stats.last_create_ms);
 	} else {
 		s->stats.restarts++;
 		SLAM_NOTE(s, "Fresh tracker (%s): old one stopped in %.0f ms, new one created in %.0f ms", reason,
 		          teardown_ms, s->stats.last_create_ms);
+		SLAM_EVENT(s, "tracker", "fresh (%s): stopped in %.0f ms, created in %.0f ms", reason, teardown_ms,
+		           s->stats.last_create_ms);
 	}
 }
 
@@ -1022,6 +1058,7 @@ reset_in_place_locked(struct xreal_air_slam *s, int64_t now_ns, const char *reas
 	} else {
 		SLAM_NOTE(s, "Tracker reset (%s)", reason);
 	}
+	SLAM_EVENT(s, "tracker", "reset in place (%s)", reason);
 }
 
 //! Called with @ref xreal_air_slam::lock held.
@@ -1131,6 +1168,12 @@ xreal_air_slam_create(enum u_logging_level log_level)
 	    s->use_wear ? "paused while the glasses are off" : "ignoring the wear sensor", divergence ? "on" : "off");
 
 	return s;
+}
+
+void
+xreal_air_slam_set_flight(struct xreal_air_slam *s, struct xreal_air_flight *flight)
+{
+	s->flight = flight;
 }
 
 void
@@ -1259,6 +1302,26 @@ handle_verdict_locked(struct xreal_air_slam *s, int64_t now, enum xreal_air_slam
 	switch (v) {
 	case XREAL_AIR_SLAM_POSE_SAME:
 	case XREAL_AIR_SLAM_POSE_OK: break;
+	case XREAL_AIR_SLAM_POSE_FIRST: SLAM_EVENT(s, "slam", "first pose (world %u)", g->world_id); break;
+	case XREAL_AIR_SLAM_POSE_RESUMED:
+		SLAM_EVENT(s, "slam", "resumed after %.3f s (world %u)", (double)gap_ns / U_TIME_1S_IN_NS, g->world_id);
+		break;
+	case XREAL_AIR_SLAM_POSE_REINIT:
+		SLAM_EVENT(s, "slam", "reinit: jumped %.3f m / %.1f deg (world %u)", g->last_dist, g->last_angle_deg,
+		           g->world_id);
+		break;
+	case XREAL_AIR_SLAM_POSE_SUSPECT:
+		SLAM_EVENT(s, "slam", "suspect: %.2f m/s (%s)", g->last_speed, g->reason != NULL ? g->reason : "?");
+		break;
+	case XREAL_AIR_SLAM_POSE_DIVERGED:
+		SLAM_EVENT(s, "slam", "diverged: %s, %.2f m/s, last step %.3f m", g->reason != NULL ? g->reason : "?",
+		           g->last_speed, g->last_dist);
+		break;
+	}
+
+	switch (v) {
+	case XREAL_AIR_SLAM_POSE_SAME:
+	case XREAL_AIR_SLAM_POSE_OK: break;
 	case XREAL_AIR_SLAM_POSE_FIRST: SLAM_NOTE(s, "First SLAM pose, warming up"); break;
 	case XREAL_AIR_SLAM_POSE_RESUMED:
 		SLAM_NOTE(s, "SLAM poses again after %.1f s, warming up", (double)gap_ns / U_TIME_1S_IN_NS);
@@ -1322,6 +1385,18 @@ get_slam_head_locked(struct xreal_air_slam *s, int64_t now, int64_t at_ns, struc
 		    &s->guard, latest_ts, &latest.pose, have_vel ? &latest.linear_velocity : NULL, imu_still);
 		handle_verdict_locked(s, now, v, gap_ns);
 
+		if (s->flight != NULL) {
+			const struct xreal_air_flight_slam_pose fp = {
+			    .ts_ns = latest_ts,
+			    .seen_ns = now,
+			    .pose = latest.pose,
+			    .linear_velocity = have_vel ? latest.linear_velocity : (struct xrt_vec3){0, 0, 0},
+			    .world_id = s->guard.world_id,
+			    .verdict = (int32_t)v,
+			};
+			xreal_air_flight_push_slam_pose(s->flight, &fp);
+		}
+
 		// For the plane detection: data from before a new world started is the old world's.
 		if (s->guard.world_id != s->planes_world_seen) {
 			s->planes_world_seen = s->guard.world_id;
@@ -1370,6 +1445,7 @@ poll_wear_locked(struct xreal_air_slam *s, int64_t now)
 			s->await_motion = false;
 			SLAM_NOTE(s, "Glasses put on: %s, 6DoF again once it has settled",
 			          s->recreate || s->xts == NULL ? "starting a fresh tracker" : "resetting the tracker");
+			SLAM_EVENT(s, "wear", "on");
 			request_restart_locked(s, now, "glasses put on", true);
 		} else {
 			s->stats.doffs++;
@@ -1377,6 +1453,7 @@ poll_wear_locked(struct xreal_air_slam *s, int64_t now)
 			SLAM_NOTE(s, "Glasses taken off: 3DoF with the position held, %s",
 			          s->recreate || s->xts == NULL ? "stopping the tracker"
 			                                        : "ignoring the tracker until they are back on");
+			SLAM_EVENT(s, "wear", "off");
 			request_restart_locked(s, now, "glasses taken off", false);
 		}
 		return;
@@ -1427,8 +1504,26 @@ xreal_air_slam_get_head_pose(struct xreal_air_slam *s,
 	                            out);
 	xreal_air_pos_history_push(&s->history, now, &out->pose.position);
 
+	if (s->flight != NULL) {
+		const struct xreal_air_flight_head fh = {
+		    .query_ns = now,
+		    .at_ns = at_timestamp_ns,
+		    .pose = out->pose,
+		    .fusion = fusion->pose.orientation,
+		    .world_id = s->guard.world_id,
+		    .slam = tracking,
+		};
+		xreal_air_flight_push_head(s->flight, &fh);
+	}
+
 	if (tracking != s->tracking) {
 		s->tracking = tracking;
+		if (tracking) {
+			SLAM_EVENT(s, "tracking", "acquired #%u", s->blend.slam_acquired);
+		} else {
+			SLAM_EVENT(s, "tracking", "lost #%u, newest pose %.0f ms old", s->blend.slam_lost,
+			           (double)s->guard.last_lag_ns / U_TIME_1MS_IN_NS);
+		}
 		uint32_t suppressed = 0;
 		if (rate_limit_ok(&s->log_tracking, now, &suppressed)) {
 			if (tracking) {

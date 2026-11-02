@@ -31,6 +31,7 @@
 #include "xrt/xrt_defines.h"
 
 #include "xreal_air_capture.h"
+#include "xreal_air_flight.h"
 #include "xreal_air_slam.h"
 
 #include "tracking/t_plane_detections.h"
@@ -163,6 +164,9 @@ struct xreal_air_hmd
 
 	//! Opt-in 6DoF tracking (XREAL_AIR_SLAM=1), fed by @ref capture, NULL otherwise.
 	struct xreal_air_slam *slam;
+
+	//! On-demand diagnostic captures with look-back, with the capture (XREAL_AIR_FLIGHT=0: NULL).
+	struct xreal_air_flight *flight;
 
 	//! Plane detection requests (XR_EXT_plane_detection), all answered from the SLAM's one plane map.
 	struct os_mutex planes_mutex;
@@ -1363,6 +1367,9 @@ teardown(struct xreal_air_hmd *hmd)
 	// After the capture, which feeds it.
 	xreal_air_slam_destroy(&hmd->slam);
 
+	// After both, which feed it. Finishes a running capture.
+	xreal_air_flight_destroy(&hmd->flight);
+
 	os_mutex_destroy(&hmd->planes_mutex);
 
 	os_thread_helper_destroy(&hmd->oth);
@@ -1754,10 +1761,20 @@ xreal_air_hmd_create_device(struct os_hid_device *sensor_device,
 
 	// Before the sensor thread starts, it feeds the capture (which feeds the SLAM).
 	hmd->slam = xreal_air_slam_create(hmd->log_level);
-	hmd->capture = xreal_air_capture_create(hmd->log_level, hmd->slam);
+	struct xreal_air_flight_config flight_config;
+	if (xreal_air_capture_wanted(hmd->slam) && xreal_air_flight_default_config(hmd->log_level, &flight_config)) {
+		hmd->flight = xreal_air_flight_create(&flight_config);
+	}
+	if (hmd->slam != NULL && hmd->flight != NULL) {
+		xreal_air_slam_set_flight(hmd->slam, hmd->flight);
+	}
+	hmd->capture = xreal_air_capture_create(hmd->log_level, hmd->slam, hmd->flight);
 	if (hmd->slam != NULL && hmd->capture == NULL) {
 		XREAL_AIR_ERROR(hmd, "6DoF requested but the camera capture could not be created, staying 3DoF");
 		xreal_air_slam_destroy(&hmd->slam);
+	}
+	if (hmd->capture == NULL) {
+		xreal_air_flight_destroy(&hmd->flight);
 	}
 	hmd->base.supported.position_tracking = hmd->slam != NULL;
 
