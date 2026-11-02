@@ -234,6 +234,22 @@ if(XRT_HAVE_JPEG)
 endif()
 
 ####
+# Bounded real-time thread priority library
+#
+# Separate from aux_util so that sd-bus (libsystemd), used to ask rtkit, is only
+# linked into what actually raises thread priority (the service compositor).
+
+if(XRT_HAVE_LINUX OR ANDROID)
+	add_library(aux_util_linux_realtime STATIC u_linux_realtime.c u_linux_realtime.h)
+	target_link_libraries(aux_util_linux_realtime PUBLIC aux-includes aux_util)
+
+	if(XRT_HAVE_SYSTEMD)
+		target_include_directories(aux_util_linux_realtime SYSTEM PRIVATE ${SYSTEMD_INCLUDE_DIRS})
+		target_link_libraries(aux_util_linux_realtime PRIVATE ${SYSTEMD_LIBRARIES})
+	endif()
+endif()
+
+####
 # Process library
 #
 
