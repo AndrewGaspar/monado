@@ -52,6 +52,7 @@
 
 #include "xreal_air/xreal_air_hmd.h"
 #include "xreal_air/xreal_air_slam.h"
+#include "xreal_air/xreal_air_slam_calib.h"
 
 #include "tracking/t_plane_detector.h"
 
@@ -511,6 +512,13 @@ cli_cmd_xreal_slam_replay(int argc, const char **argv)
 		} else if (t_next == t_cam) {
 			const struct cam_row *r = &cams[ci++];
 			const double rel_s = (double)(r->ts - cams[0].ts) / 1e9;
+			// A recording can stop its IMU before its last frames (living-room-01: 53 ms). Basalt
+			// integrates a frame up to the next IMU sample past it, so it waits for one forever: with
+			// deterministic=1 the push waits for the frame's pose and this (the only IMU source) hangs.
+			// Live the IMU keeps coming; here those frames could never be tracked anyway.
+			if (xreal_air_slam_frame_timestamp(r->ts, r->exposure, 0) >= imu[imu_count - 1].ts) {
+				continue;
+			}
 			if (in_window(&gap, rel_s)) {
 				continue; // Simulated camera stall.
 			}
