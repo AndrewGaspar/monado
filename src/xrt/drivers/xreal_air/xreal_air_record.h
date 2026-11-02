@@ -26,6 +26,8 @@
 #include "xreal_air_camera_decode.h"
 #include "xreal_air_hmd.h"
 
+#include <stdio.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -117,6 +119,49 @@ xreal_air_record_push_raw(struct xreal_air_record *r, const uint8_t *data, size_
  */
 void
 xreal_air_record_destroy(struct xreal_air_record **r_ptr);
+
+
+/*
+ *
+ * The file formats, for other writers of the same layout (the flight recorder, xreal_air_flight.h).
+ *
+ */
+
+//! Header lines of mav0/imu0/data.csv, xreal/camera_frames.csv and xreal/imu_raw.csv.
+extern const char xreal_air_record_imu0_header[];
+extern const char xreal_air_record_cam_frames_header[];
+extern const char xreal_air_record_imu_raw_header[];
+
+//! The text of xreal/README.txt.
+extern const char xreal_air_record_readme[];
+
+//! mkdir -p, true if @p path is a directory afterwards.
+bool
+xreal_air_record_mkdir_p(const char *path);
+
+/*!
+ * One xreal/imu_raw.csv row, and the mav0/imu0/data.csv row if the sample has a EuRoC timestamp.
+ *
+ * @return Whether the mav0 row was written.
+ */
+bool
+xreal_air_record_write_imu_rows(FILE *imu_raw_csv, FILE *imu0_csv, const struct xreal_air_record_imu *s);
+
+//! One xreal/camera_frames.csv row.
+void
+xreal_air_record_write_cam_frame_row(FILE *f, const struct xreal_air_record_cam_frame *s);
+
+/*!
+ * Write xreal/factory_calibration.json (@p document verbatim, if not NULL) and the converted
+ * calibration files into @p dir (xreal/ must exist). @p imu_rate_hz <= 0 means 1 kHz.
+ */
+void
+xreal_air_record_write_calibration(const char *dir,
+                                   enum u_logging_level log_level,
+                                   const char *document,
+                                   size_t document_len,
+                                   const struct xreal_air_parsed_calibration *calib,
+                                   double imu_rate_hz);
 
 #ifdef __cplusplus
 }

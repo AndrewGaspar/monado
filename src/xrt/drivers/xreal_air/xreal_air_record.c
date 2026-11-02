@@ -138,8 +138,8 @@ struct xreal_air_record
  *
  */
 
-static bool
-mkdir_p(const char *path)
+bool
+xreal_air_record_mkdir_p(const char *path)
 {
 	char tmp[PATH_MAX];
 	(void)snprintf(tmp, sizeof(tmp), "%s", path);
@@ -178,21 +178,35 @@ dir_is_missing_or_empty(const char *path)
 	return empty;
 }
 
+//! Where and how loud: what the file writing helpers need of a recording.
+struct out_dir
+{
+	const char *path;
+	enum u_logging_level log_level;
+};
+
 static FILE *
-open_file(struct xreal_air_record *r, const char *rel, const char *header)
+open_file_in(const struct out_dir *d, const char *rel, const char *header)
 {
 	char path[PATH_MAX];
-	(void)snprintf(path, sizeof(path), "%s/%s", r->path, rel);
+	(void)snprintf(path, sizeof(path), "%s/%s", d->path, rel);
 
 	FILE *f = fopen(path, "w");
 	if (f == NULL) {
-		REC_ERROR(r, "Could not open '%s': %s", path, strerror(errno));
+		REC_ERROR(d, "Could not open '%s': %s", path, strerror(errno));
 		return NULL;
 	}
 	if (header != NULL) {
 		(void)fputs(header, f);
 	}
 	return f;
+}
+
+static FILE *
+open_file(struct xreal_air_record *r, const char *rel, const char *header)
+{
+	const struct out_dir d = {r->path, r->log_level};
+	return open_file_in(&d, rel, header);
 }
 
 static void
@@ -329,9 +343,9 @@ static const char *const fisheye624_names[XREAL_AIR_SLAM_CAMERA_MAX_KC] = {
 #define DEFAULT_GYRO_BIAS_STD 0.0001
 
 static void
-write_basalt_calibration(struct xreal_air_record *r, const struct xreal_air_parsed_calibration *calib, double imu_rate)
+write_basalt_calibration(const struct out_dir *d, const struct xreal_air_parsed_calibration *calib, double imu_rate)
 {
-	FILE *f = open_file(r, "xreal/calibration_basalt.json", NULL);
+	FILE *f = open_file_in(d, "xreal/calibration_basalt.json", NULL);
 	if (f == NULL) {
 		return;
 	}
@@ -399,9 +413,9 @@ write_basalt_calibration(struct xreal_air_record *r, const struct xreal_air_pars
 }
 
 static void
-write_kalibr_calibration(struct xreal_air_record *r, const struct xreal_air_parsed_calibration *calib, double imu_rate)
+write_kalibr_calibration(const struct out_dir *d, const struct xreal_air_parsed_calibration *calib, double imu_rate)
 {
-	FILE *f = open_file(r, "xreal/camchain-imucam.yaml", NULL);
+	FILE *f = open_file_in(d, "xreal/camchain-imucam.yaml", NULL);
 	if (f == NULL) {
 		return;
 	}
@@ -443,7 +457,7 @@ write_kalibr_calibration(struct xreal_air_record *r, const struct xreal_air_pars
 	}
 	close_file(&f);
 
-	f = open_file(r, "xreal/imu.yaml", NULL);
+	f = open_file_in(d, "xreal/imu.yaml", NULL);
 	if (f == NULL) {
 		return;
 	}
@@ -461,14 +475,19 @@ write_kalibr_calibration(struct xreal_air_record *r, const struct xreal_air_pars
 	close_file(&f);
 }
 
-static void
-write_calibration_files(struct xreal_air_record *r,
-                        const char *document,
-                        size_t document_len,
-                        const struct xreal_air_parsed_calibration *calib)
+void
+xreal_air_record_write_calibration(const char *dir,
+                                   enum u_logging_level log_level,
+                                   const char *document,
+                                   size_t document_len,
+                                   const struct xreal_air_parsed_calibration *calib,
+                                   double imu_rate_hz)
 {
+	const struct out_dir dd = {dir, log_level};
+	const struct out_dir *d = &dd;
+
 	if (document != NULL) {
-		FILE *f = open_file(r, "xreal/factory_calibration.json", NULL);
+		FILE *f = open_file_in(d, "xreal/factory_calibration.json", NULL);
 		if (f != NULL) {
 			(void)fwrite(document, 1, document_len, f);
 			close_file(&f);
@@ -480,16 +499,16 @@ write_calibration_files(struct xreal_air_record *r,
 		cams_valid = cams_valid && calib->slam_camera[i].valid;
 	}
 	if (!cams_valid) {
-		REC_WARN(r, "No SLAM_camera calibration in the factory blob, not writing converted calibration");
+		REC_WARN(d, "No SLAM_camera calibration in the factory blob, not writing converted calibration");
 		return;
 	}
 
-	const double rate = r->imu_rate_hz > 0 ? r->imu_rate_hz : 1000.0;
-	write_basalt_calibration(r, calib, rate);
-	write_kalibr_calibration(r, calib, rate);
+	const double rate = imu_rate_hz > 0 ? imu_rate_hz : 1000.0;
+	write_basalt_calibration(d, calib, rate);
+	write_kalibr_calibration(d, calib, rate);
 }
 
-static const char readme[] =
+const char xreal_air_record_readme[] =
     "XREAL Air 2 Ultra camera + IMU recording (Monado xreal_air driver)\n"
     "===================================================================\n"
     "\n"
@@ -538,6 +557,21 @@ static const char readme[] =
     "  divisor, and the calibrated gyro/accel as written to mav0/imu0.\n"
     "xreal/raw/<v4l2_seq>.bin        The first few raw (scrambled) 640x482 frames.\n";
 
+const char xreal_air_record_imu0_header[] =
+    "#timestamp [ns],w_RS_S_x [rad s^-1],w_RS_S_y [rad s^-1],w_RS_S_z [rad s^-1],"
+    "a_RS_S_x [m s^-2],a_RS_S_y [m s^-2],a_RS_S_z [m s^-2]\r\n";
+
+const char xreal_air_record_cam_frames_header[] =
+    "cam,v4l2_seq,kernel_ns,dequeue_ns,device_ns,counter,exposure,gain,id58,id59,"
+    "pair_ts,phase,mapped_ns,imu_clock_ns,euroc_ns,telemetry_hex\n";
+
+const char xreal_air_record_imu_raw_header[] =
+    "euroc_ns,device_ts,host_ns,fusion_ns,temperature_c,"
+    "gyro_raw_x,gyro_raw_y,gyro_raw_z,gyro_mul,gyro_div,"
+    "accel_raw_x,accel_raw_y,accel_raw_z,accel_mul,accel_div,"
+    "mag_raw_x,mag_raw_y,mag_raw_z,mag_mul,mag_div,"
+    "gyro_x,gyro_y,gyro_z,accel_x,accel_y,accel_z\n";
+
 static bool
 create_files(struct xreal_air_record *r)
 {
@@ -545,28 +579,19 @@ create_files(struct xreal_air_record *r)
 	for (size_t i = 0; i < ARRAY_SIZE(dirs); i++) {
 		char path[PATH_MAX];
 		(void)snprintf(path, sizeof(path), "%s/%s", r->path, dirs[i]);
-		if (!mkdir_p(path)) {
+		if (!xreal_air_record_mkdir_p(path)) {
 			REC_ERROR(r, "Could not create '%s': %s", path, strerror(errno));
 			return false;
 		}
 	}
 
-	r->imu_csv = open_file(r, "mav0/imu0/data.csv",
-	                       "#timestamp [ns],w_RS_S_x [rad s^-1],w_RS_S_y [rad s^-1],w_RS_S_z [rad s^-1],"
-	                       "a_RS_S_x [m s^-2],a_RS_S_y [m s^-2],a_RS_S_z [m s^-2]\r\n");
+	r->imu_csv = open_file(r, "mav0/imu0/data.csv", xreal_air_record_imu0_header);
 	r->cam_csv[0] = open_file(r, "mav0/cam0/data.csv", "#timestamp [ns],filename\r\n");
 	r->cam_csv[1] = open_file(r, "mav0/cam1/data.csv", "#timestamp [ns],filename\r\n");
-	r->cam_frames_csv = open_file(r, "xreal/camera_frames.csv",
-	                              "cam,v4l2_seq,kernel_ns,dequeue_ns,device_ns,counter,exposure,gain,id58,id59,"
-	                              "pair_ts,phase,mapped_ns,imu_clock_ns,euroc_ns,telemetry_hex\n");
-	r->imu_raw_csv = open_file(r, "xreal/imu_raw.csv",
-	                           "euroc_ns,device_ts,host_ns,fusion_ns,temperature_c,"
-	                           "gyro_raw_x,gyro_raw_y,gyro_raw_z,gyro_mul,gyro_div,"
-	                           "accel_raw_x,accel_raw_y,accel_raw_z,accel_mul,accel_div,"
-	                           "mag_raw_x,mag_raw_y,mag_raw_z,mag_mul,mag_div,"
-	                           "gyro_x,gyro_y,gyro_z,accel_x,accel_y,accel_z\n");
+	r->cam_frames_csv = open_file(r, "xreal/camera_frames.csv", xreal_air_record_cam_frames_header);
+	r->imu_raw_csv = open_file(r, "xreal/imu_raw.csv", xreal_air_record_imu_raw_header);
 
-	FILE *f = open_file(r, "xreal/README.txt", readme);
+	FILE *f = open_file(r, "xreal/README.txt", xreal_air_record_readme);
 	close_file(&f);
 
 	return r->imu_csv != NULL && r->cam_csv[0] != NULL && r->cam_csv[1] != NULL && r->cam_frames_csv != NULL &&
@@ -580,12 +605,12 @@ create_files(struct xreal_air_record *r)
  *
  */
 
-static void
-write_imu(struct xreal_air_record *r, const struct xreal_air_record_imu *s)
+bool
+xreal_air_record_write_imu_rows(FILE *imu_raw_csv, FILE *imu0_csv, const struct xreal_air_record_imu *s)
 {
 	const struct xreal_air_parsed_sample *raw = &s->raw;
 
-	(void)fprintf(r->imu_raw_csv,
+	(void)fprintf(imu_raw_csv,
 	              "%" PRId64 ",%" PRIu64 ",%" PRId64 ",%" PRId64
 	              ",%.3f,"
 	              "%d,%d,%d,%d,%d,"
@@ -600,11 +625,20 @@ write_imu(struct xreal_air_record *r, const struct xreal_air_record_imu *s)
 
 	// Never put an invalid timestamp into mav0 (the capture maps or falls back, this is a backstop).
 	if (s->euroc_ns <= 0) {
-		return;
+		return false;
 	}
 
-	(void)fprintf(r->imu_csv, "%" PRId64 ",%.9g,%.9g,%.9g,%.9g,%.9g,%.9g\r\n", s->euroc_ns, s->gyro.x, s->gyro.y,
+	(void)fprintf(imu0_csv, "%" PRId64 ",%.9g,%.9g,%.9g,%.9g,%.9g,%.9g\r\n", s->euroc_ns, s->gyro.x, s->gyro.y,
 	              s->gyro.z, s->accel.x, s->accel.y, s->accel.z);
+	return true;
+}
+
+static void
+write_imu(struct xreal_air_record *r, const struct xreal_air_record_imu *s)
+{
+	if (!xreal_air_record_write_imu_rows(r->imu_raw_csv, r->imu_csv, s)) {
+		return;
+	}
 
 	if (r->imu_written == 0) {
 		r->imu_first_ns = s->euroc_ns;
@@ -613,8 +647,8 @@ write_imu(struct xreal_air_record *r, const struct xreal_air_record_imu *s)
 	r->imu_written++;
 }
 
-static void
-write_cam_frame(struct xreal_air_record *r, const struct xreal_air_record_cam_frame *s)
+void
+xreal_air_record_write_cam_frame_row(FILE *f, const struct xreal_air_record_cam_frame *s)
 {
 	const struct xreal_air_cam_telemetry *t = &s->telemetry;
 
@@ -623,12 +657,18 @@ write_cam_frame(struct xreal_air_record *r, const struct xreal_air_record_cam_fr
 		(void)snprintf(hex + i * 2, 3, "%02x", t->raw[i]);
 	}
 
-	(void)fprintf(r->cam_frames_csv,
+	(void)fprintf(f,
 	              "%d,%u,%" PRId64 ",%" PRId64 ",%" PRIu64 ",%u,%u,%u,%u,%u,%" PRIu64 ",%u,%" PRId64 ",%" PRId64
 	              ",%" PRId64 ",%s\n",
 	              (int)s->cam, s->v4l2_sequence, s->kernel_ns, s->dequeue_ns, t->device_ns, t->counter, t->exposure,
 	              t->gain, t->id_byte58, t->id_byte59, t->pair_ts, s->phase, s->mapped_ns, s->imu_clock_ns,
 	              s->euroc_ns, hex);
+}
+
+static void
+write_cam_frame(struct xreal_air_record *r, const struct xreal_air_record_cam_frame *s)
+{
+	xreal_air_record_write_cam_frame_row(r->cam_frames_csv, s);
 }
 
 static void
@@ -721,7 +761,7 @@ maybe_write_calibration_locked(struct xreal_air_record *r, bool force)
 	}
 
 	os_thread_helper_unlock(&r->oth);
-	write_calibration_files(r, doc, doc_len, &calib);
+	xreal_air_record_write_calibration(r->path, r->log_level, doc, doc_len, &calib, r->imu_rate_hz);
 	free(doc);
 	os_thread_helper_lock(&r->oth);
 }
