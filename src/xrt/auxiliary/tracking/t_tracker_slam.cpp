@@ -88,7 +88,7 @@ DEBUG_GET_ONCE_NUM_OPTION(slam_openvr_groundtruth_device, "SLAM_OPENVR_GROUNDTRU
 DEBUG_GET_ONCE_NUM_OPTION(slam_prediction_type, "SLAM_PREDICTION_TYPE", long(SLAM_PRED_DEAD_RECKONING))
 DEBUG_GET_ONCE_BOOL_OPTION(slam_write_csvs, "SLAM_WRITE_CSVS", false)
 DEBUG_GET_ONCE_OPTION(slam_csv_path, "SLAM_CSV_PATH", "evaluation/")
-DEBUG_GET_ONCE_BOOL_OPTION(slam_timing_stat, "SLAM_TIMING_STAT", true)
+DEBUG_GET_ONCE_BOOL_OPTION(slam_timing_stat, "SLAM_TIMING_STAT", false)
 DEBUG_GET_ONCE_BOOL_OPTION(slam_features_stat, "SLAM_FEATURES_STAT", true)
 DEBUG_GET_ONCE_NUM_OPTION(slam_cam_count, "SLAM_CAM_COUNT", 2)
 
@@ -233,6 +233,13 @@ struct TimingWriter : public CSVWriter<timing_sample>
 	TimingWriter(const string &dir, const string &fn, bool e, const vector<string> &cn)
 	    : CSVWriter<timing_sample>(dir, fn, e, cn)
 	{}
+
+	//! The columns are only known once the tracker reported its timing titles (before the first push).
+	void
+	set_columns(const vector<string> &cn)
+	{
+		column_names = cn;
+	}
 };
 
 //! Writes feature information specific to a particular estimated pose
@@ -1613,6 +1620,12 @@ t_slam_create(struct xrt_frame_context *xfctx,
 	t.filt_traj_writer = new TrajectoryWriter(dir, "filtering.csv", write_csvs);
 
 	setup_ui(t);
+
+	// Per-stage pipeline timestamps from the start (SLAM_TIMING_STAT), see timing.csv (SLAM_WRITE_CSVS)
+	t.slam_times_writer->set_columns(t.timing.columns);
+	if (config->timing_stat && t.exts.has_pose_timing) {
+		t.timing.enable_btn.cb(&t);
+	}
 
 	// Setup OpenVR groundtruth tracker
 	if (config->openvr_groundtruth_device > 0) {
